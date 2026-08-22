@@ -50,6 +50,9 @@ type DeviceStore interface {
 	CountByModel(ctx context.Context) (map[string]int64, error)
 	UpdateVersion(ctx context.Context, id, newVersion string) error
 	Total(ctx context.Context) (int64, error)
+	// DeviceCountSnapshot 在同一把锁下取得 total / online / listTotal 快照，
+	// 用于统计总览与设备列表 total 的严格一致。
+	DeviceCountSnapshot() (total, online, listTotal int64)
 }
 
 // UpgradeTaskStore 升级任务存储接口。
@@ -67,6 +70,9 @@ type UpgradeTaskStore interface {
 	PendingCount(ctx context.Context) (int64, error)
 	PausedCount(ctx context.Context) (int64, error)
 	FinishedCount(ctx context.Context) (int64, error)
+	// TaskCountSnapshot 在同一把锁下取得 total / running / listTotal 快照，
+	// 用于统计总览与任务列表 total 的严格一致。
+	TaskCountSnapshot() (total, running, listTotal int64)
 }
 
 // TaskExecStore 任务-设备执行记录存储。

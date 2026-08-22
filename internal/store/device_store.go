@@ -27,24 +27,15 @@ func NewDeviceStore() DeviceStore {
 	return &inMemoryDeviceStore{data: make(map[string]*model.Device)}
 }
 
+// deviceStatusBucket 按设备存储状态分桶（online/offline/unknown）。
+// 与 GET /devices?status=online 过滤口径一致：仅看 d.Status，不依据心跳 TTL 降级，
+// 这样 overview 的 online_count 与设备列表 total 严格相等。
+// lastHb/limit 参数保留以维持签名，不再参与分桶判定。
 func deviceStatusBucket(status model.DeviceStatus, lastHb time.Time, limit time.Time) (online, offline, unknown int) {
-	if status == "" || status == model.DeviceStatusUnknown || lastHb.IsZero() {
-		if !lastHb.IsZero() && lastHb.Before(limit) {
-			return 0, 0, 1
-		}
-		if status == model.DeviceStatusOnline {
-			if lastHb.Before(limit) && !lastHb.IsZero() {
-				return 0, 0, 1
-			}
-			return 1, 0, 0
-		}
-		return 0, 0, 1
-	}
+	_ = lastHb
+	_ = limit
 	switch status {
 	case model.DeviceStatusOnline:
-		if !lastHb.IsZero() && lastHb.Before(limit) {
-			return 0, 0, 1
-		}
 		return 1, 0, 0
 	case model.DeviceStatusOffline:
 		return 0, 1, 0
@@ -65,15 +56,14 @@ func (s *inMemoryDeviceStore) Create(_ context.Context, d *model.Device) error {
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.data[d.ID]; ok {
-		s.mu.Unlock()
 		return model.ErrAlreadyRegistered
 	}
 	cp := *d
 	s.data[d.ID] = &cp
-	s.mu.Unlock()
-	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
-	o, f, u := deviceStatusBucket(d.Status, d.LastHeartbeatAt, limit)
+	// 计数器与 data 在同一临界区内更新，保证观察到的计数与 List 一致。
+	o, f, u := deviceStatusBucket(d.Status, d.LastHeartbeatAt, time.Time{})
 	s.applyDeviceDelta(o, f, u, 1)
 	return nil
 }
@@ -83,28 +73,26 @@ func (s *inMemoryDeviceStore) Update(_ context.Context, d *model.Device) error {
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	old, ok := s.data[d.ID]
 	if !ok {
-		s.mu.Unlock()
 		return model.ErrDeviceNotFound
 	}
 	oldStatus := old.Status
 	oldHb := old.LastHeartbeatAt
 	cp := *d
 	s.data[d.ID] = &cp
-	s.mu.Unlock()
-	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
-	oo, of, ou := deviceStatusBucket(oldStatus, oldHb, limit)
-	no, nf, nu := deviceStatusBucket(d.Status, d.LastHeartbeatAt, limit)
+	oo, of, ou := deviceStatusBucket(oldStatus, oldHb, time.Time{})
+	no, nf, nu := deviceStatusBucket(d.Status, d.LastHeartbeatAt, time.Time{})
 	s.applyDeviceDelta(no-oo, nf-of, nu-ou, 0)
 	return nil
 }
 
 func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version string, status model.DeviceStatus, ip string, ts time.Time) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	d, ok := s.data[id]
 	if !ok {
-		s.mu.Unlock()
 		return model.ErrDeviceNotFound
 	}
 	oldStatus := d.Status
@@ -122,10 +110,8 @@ func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version st
 	d.UpdatedAt = ts
 	cp := *d
 	s.data[id] = &cp
-	s.mu.Unlock()
-	limit := ts.Add(-time.Duration(getTTL()) * time.Second)
-	oo, of, ou := deviceStatusBucket(oldStatus, oldHb, limit)
-	no, nf, nu := deviceStatusBucket(d.Status, ts, limit)
+	oo, of, ou := deviceStatusBucket(oldStatus, oldHb, ts)
+	no, nf, nu := deviceStatusBucket(d.Status, ts, ts)
 	s.applyDeviceDelta(no-oo, nf-of, nu-ou, 0)
 	return nil
 }
@@ -143,17 +129,15 @@ func (s *inMemoryDeviceStore) Get(_ context.Context, id string) (*model.Device, 
 
 func (s *inMemoryDeviceStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	v, ok := s.data[id]
 	if !ok {
-		s.mu.Unlock()
 		return model.ErrDeviceNotFound
 	}
 	status := v.Status
 	lastHb := v.LastHeartbeatAt
 	delete(s.data, id)
-	s.mu.Unlock()
-	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
-	o, f, u := deviceStatusBucket(status, lastHb, limit)
+	o, f, u := deviceStatusBucket(status, lastHb, time.Time{})
 	s.applyDeviceDelta(-o, -f, -u, -1)
 	return nil
 }
@@ -223,6 +207,8 @@ func (s *inMemoryDeviceStore) ListByIDs(_ context.Context, ids []string) ([]*mod
 }
 
 func (s *inMemoryDeviceStore) CountByStatus(_ context.Context) (online, offline, unknown int64, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	o := s.onlineCount
 	f := s.offlineCount
 	u := s.unknownCount
@@ -290,11 +276,29 @@ func (s *inMemoryDeviceStore) UpdateVersion(_ context.Context, id, newVersion st
 }
 
 func (s *inMemoryDeviceStore) Total(_ context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v := s.totalCount
 	if v < 0 {
 		v = 0
 	}
 	return int64(v), nil
+}
+
+// DeviceCountSnapshot 在同一把读锁下取得此刻的计数快照，
+// 保证 total / online / listTotal 三者来自同一状态（overview 与 List 一致性的基础）。
+func (s *inMemoryDeviceStore) DeviceCountSnapshot() (total, online, listTotal int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t := int64(s.totalCount)
+	o := int64(s.onlineCount)
+	if t < 0 {
+		t = 0
+	}
+	if o < 0 {
+		o = 0
+	}
+	return t, o, int64(len(s.data))
 }
 
 func paginateD(list []*model.Device, pn, ps int) ([]*model.Device, int64, error) {

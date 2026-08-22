@@ -62,13 +62,13 @@ func (s *inMemoryTaskStore) Create(_ context.Context, t *model.UpgradeTask) erro
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.data[t.ID]; ok {
-		s.mu.Unlock()
 		return model.ErrConflict
 	}
 	cp := *t
 	s.data[t.ID] = &cp
-	s.mu.Unlock()
+	// 计数器与 data 在同一临界区内更新，保证观察到的计数与 List 一致。
 	s.totalCount += 1
 	r, p, pa, f, c, fa := countForStatus(t.Status)
 	s.applyDelta(r, p, pa, f, c, fa)
@@ -80,15 +80,14 @@ func (s *inMemoryTaskStore) Update(_ context.Context, t *model.UpgradeTask) erro
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	old, ok := s.data[t.ID]
 	if !ok {
-		s.mu.Unlock()
 		return model.ErrTaskNotFound
 	}
 	oldStatus := old.Status
 	cp := *t
 	s.data[t.ID] = &cp
-	s.mu.Unlock()
 	or, op, opa, of, oc, ofa := countForStatus(oldStatus)
 	nr, np, npa, nf, nc, nfa := countForStatus(t.Status)
 	s.applyDelta(nr-or, np-op, npa-opa, nf-of, nc-oc, nfa-ofa)
@@ -110,14 +109,13 @@ func (s *inMemoryTaskStore) Get(_ context.Context, id string) (*model.UpgradeTas
 
 func (s *inMemoryTaskStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	v, ok := s.data[id]
 	if !ok {
-		s.mu.Unlock()
 		return model.ErrTaskNotFound
 	}
 	status := v.Status
 	delete(s.data, id)
-	s.mu.Unlock()
 	s.totalCount -= 1
 	r, p, pa, f, c, fa := countForStatus(status)
 	s.applyDelta(-r, -p, -pa, -f, -c, -fa)
@@ -126,9 +124,9 @@ func (s *inMemoryTaskStore) Delete(_ context.Context, id string) error {
 
 func (s *inMemoryTaskStore) SetStatus(_ context.Context, id string, status model.TaskStatus, endTime time.Time) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	v, ok := s.data[id]
 	if !ok {
-		s.mu.Unlock()
 		return model.ErrTaskNotFound
 	}
 	oldStatus := v.Status
@@ -141,7 +139,6 @@ func (s *inMemoryTaskStore) SetStatus(_ context.Context, id string, status model
 	cp.DeviceIDs = cloneStrSlice(v.DeviceIDs)
 	cp.GroupFilter = cloneStrSlice(v.GroupFilter)
 	s.data[id] = &cp
-	s.mu.Unlock()
 	or, op, opa, of, oc, ofa := countForStatus(oldStatus)
 	nr, np, npa, nf, nc, nfa := countForStatus(status)
 	s.applyDelta(nr-or, np-op, npa-opa, nf-of, nc-oc, nfa-ofa)
@@ -247,6 +244,8 @@ func (s *inMemoryTaskStore) ListRunning(_ context.Context) ([]*model.UpgradeTask
 }
 
 func (s *inMemoryTaskStore) Total(_ context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v := s.totalCount
 	if v < 0 {
 		v = 0
@@ -255,6 +254,8 @@ func (s *inMemoryTaskStore) Total(_ context.Context) (int64, error) {
 }
 
 func (s *inMemoryTaskStore) RunningCount(_ context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v := s.runningCount
 	if v < 0 {
 		v = 0
@@ -263,6 +264,8 @@ func (s *inMemoryTaskStore) RunningCount(_ context.Context) (int64, error) {
 }
 
 func (s *inMemoryTaskStore) PendingCount(_ context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v := s.pendingCount
 	if v < 0 {
 		v = 0
@@ -271,6 +274,8 @@ func (s *inMemoryTaskStore) PendingCount(_ context.Context) (int64, error) {
 }
 
 func (s *inMemoryTaskStore) PausedCount(_ context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v := s.pausedCount
 	if v < 0 {
 		v = 0
@@ -279,11 +284,29 @@ func (s *inMemoryTaskStore) PausedCount(_ context.Context) (int64, error) {
 }
 
 func (s *inMemoryTaskStore) FinishedCount(_ context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v := s.finishedCount
 	if v < 0 {
 		v = 0
 	}
 	return int64(v), nil
+}
+
+// TaskCountSnapshot 在同一把读锁下取得此刻的计数快照，
+// 保证 total / running / listTotal 三者来自同一状态（overview 与 List 一致性的基础）。
+func (s *inMemoryTaskStore) TaskCountSnapshot() (total, running, listTotal int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t := int64(s.totalCount)
+	r := int64(s.runningCount)
+	if t < 0 {
+		t = 0
+	}
+	if r < 0 {
+		r = 0
+	}
+	return t, r, int64(len(s.data))
 }
 
 func cloneStrSlice(s []string) []string {
