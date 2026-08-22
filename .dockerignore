@@ -1,0 +1,41 @@
+# .dockerignore —— 本 Zhi 评测构建忽略列表
+# 只让 docker 构建上下文拷贝必要源码，加快 COPY 步骤。
+
+# 版本控制
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Go 本地产物与缓存
+vendor/
+*.out
+*.test
+coverage.*
+go.work
+go.work.sum
+
+# 本项目运行时数据
+data/
+logs/
+*.log
+artifacts/
+
+# 打包 / 文档输出（可选，保留 BUG_CATALOG.md 到镜像可删除下面两行）
+*.tar.gz
+*.zip
+# BUG_CATALOG.md
+# BENZHI_README.md
+
+# Docker / 构建脚本（脚本自身一般不需要进构建上下文）
+Dockerfile
+docker-compose*
+build_*.sh
