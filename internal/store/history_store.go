@@ -53,36 +53,54 @@ func (s *inMemoryHistoryStore) Create(_ context.Context, h *model.UpgradeHistory
 	return nil
 }
 
+// UnsafePutData 原子地写入一条历史数据。
+//
+// 虽然方法名带 Unsafe 前缀（保留历史接口签名不变），但实现内部已通过
+// s.mu 加锁保护，保证与 FindLatestByDevice / CountDaily 等读操作并发安全。
 func (s *inMemoryHistoryStore) UnsafePutData(h *model.UpgradeHistory) {
 	if h == nil || h.ID == "" {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	cp := *h
 	s.data[h.ID] = &cp
 }
 
+// UnsafePutByDeviceIndex 维护设备 -> 历史 id 索引（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafePutByDeviceIndex(deviceID, historyID string) {
 	if deviceID == "" || historyID == "" {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.byDevice[deviceID] = append(s.byDevice[deviceID], historyID)
 }
 
+// UnsafePutByTaskIndex 维护任务 -> 历史 id 索引（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafePutByTaskIndex(taskID, historyID string) {
 	if taskID == "" || historyID == "" {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.byTask[taskID] = append(s.byTask[taskID], historyID)
 }
 
+// UnsafePutByDayIndex 维护日期 -> 历史 id 索引（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafePutByDayIndex(day, historyID string) {
 	if day == "" || historyID == "" {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.byDay[day] = append(s.byDay[day], historyID)
 }
 
+// UnsafeReadDataSnapshot 返回全部历史 id 的快照（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafeReadDataSnapshot() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	ids := make([]string, 0, len(s.data))
 	for id := range s.data {
 		ids = append(ids, id)
@@ -90,7 +108,10 @@ func (s *inMemoryHistoryStore) UnsafeReadDataSnapshot() []string {
 	return ids
 }
 
+// UnsafeReadByDeviceKeys 返回全部设备 id 快照（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafeReadByDeviceKeys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	keys := make([]string, 0, len(s.byDevice))
 	for k := range s.byDevice {
 		keys = append(keys, k)
@@ -98,7 +119,10 @@ func (s *inMemoryHistoryStore) UnsafeReadByDeviceKeys() []string {
 	return keys
 }
 
+// UnsafeReadByDayKeys 返回全部日期 key 快照（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafeReadByDayKeys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	keys := make([]string, 0, len(s.byDay))
 	for k := range s.byDay {
 		keys = append(keys, k)
@@ -106,19 +130,46 @@ func (s *inMemoryHistoryStore) UnsafeReadByDayKeys() []string {
 	return keys
 }
 
+// UnsafeGetByDevice 返回某设备对应历史 id 切片的拷贝（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafeGetByDevice(deviceID string) []string {
-	return s.byDevice[deviceID]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if ids, ok := s.byDevice[deviceID]; ok {
+		out := make([]string, len(ids))
+		copy(out, ids)
+		return out
+	}
+	return nil
 }
 
+// UnsafeGetByDay 返回某日期对应历史 id 切片的拷贝（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafeGetByDay(day string) []string {
-	return s.byDay[day]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if ids, ok := s.byDay[day]; ok {
+		out := make([]string, len(ids))
+		copy(out, ids)
+		return out
+	}
+	return nil
 }
 
+// UnsafeGetRawData 返回某条历史的深拷贝（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafeGetRawData(id string) *model.UpgradeHistory {
-	return s.data[id]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.data[id]
+	if !ok {
+		return nil
+	}
+	cp := *v
+	return &cp
 }
 
+// UnsafeGetRawDataSize 返回历史数据总量（加锁保护）。
 func (s *inMemoryHistoryStore) UnsafeGetRawDataSize() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.data)
 }
 
@@ -149,13 +200,14 @@ func (s *inMemoryHistoryStore) Get(_ context.Context, id string) (*model.Upgrade
 
 func (s *inMemoryHistoryStore) FindLatestByDevice(_ context.Context, deviceID, taskID string) (*model.UpgradeHistory, error) {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	ids, ok := s.byDevice[deviceID]
 	if !ok {
-		s.mu.RUnlock()
 		return nil, model.ErrNotFound
 	}
-	idsCopy := ids
-	s.mu.RUnlock()
+	// 拷贝一份 id 切片，避免在持锁遍历期间引用到被并发 append 扩容的底层数组。
+	idsCopy := make([]string, len(ids))
+	copy(idsCopy, ids)
 	var latest *model.UpgradeHistory
 	for _, id := range idsCopy {
 		v := s.data[id]
@@ -298,19 +350,18 @@ func (s *inMemoryHistoryStore) CountDaily(_ context.Context, days int) ([]model.
 		days = 7
 	}
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	today := timeutil.TodayStart()
 	out := make([]model.DailyUpgrade, days)
-	dateKeys := make([]string, 0, days)
 	for i := 0; i < days; i++ {
 		d := today.AddDate(0, 0, -(days - 1 - i))
-		dateKeys = append(dateKeys, timeutil.FormatDate(d))
-	}
-	s.mu.RUnlock()
-	for i := 0; i < days; i++ {
-		dateKey := dateKeys[i]
+		dateKey := timeutil.FormatDate(d)
 		du := model.DailyUpgrade{Date: dateKey}
+		// 拷贝 id 切片，避免引用到被并发 append 扩容的底层数组。
 		if ids, ok := s.byDay[dateKey]; ok {
-			for _, id := range ids {
+			idsCopy := make([]string, len(ids))
+			copy(idsCopy, ids)
+			for _, id := range idsCopy {
 				v := s.data[id]
 				if v == nil {
 					continue

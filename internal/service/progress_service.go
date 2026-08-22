@@ -113,10 +113,8 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 		if err := p.history.AppendHistoryRecord(ctx, h); err != nil {
 			logger.Warn("append history failed", "task_id", req.TaskID, "device_id", req.DeviceID, "err", err)
 		}
-		if day := timeutil.FormatDate(now); day != "" {
-			p.history.TouchDayBucket(day, h.ID)
-		}
-		p.history.TouchDeviceBucket(req.DeviceID, h.ID)
+		// AppendHistoryRecord 内部已写好 byTask/byDevice/byDay 索引，
+		// 这里不再重复 Touch，否则同一条记录会被索引两次，导致 CountDaily 重复计数。
 		if req.Status == model.UpgradeStatusSuccess {
 			_ = p.devices.UpdateVersion(ctx, req.DeviceID, t.TargetVersion)
 		}
