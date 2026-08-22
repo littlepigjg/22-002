@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"sort"
+	"sync"
 
 	"firmware-upgrade/internal/config"
 	"firmware-upgrade/internal/model"
@@ -13,19 +14,25 @@ import (
 )
 
 type GrayResult struct {
-	Hit       bool
-	Reason    string
-	Bucket    string
+	Hit    bool
+	Reason string
+	Bucket string
 }
 
+// GrayService 灰度选择服务。
+//
+// 注意：本服务为全局单例，被多个 goroutine 并发调用（如批量创建升级任务）。
+// 因此所有跨调用的可变状态都必须受 bufMu 保护，单次调用内的临时缓冲区
+// 必须使用局部变量，绝不能复用实例字段，否则会产生 DATA RACE 与切片别名
+// 导致的越界、设备重复分配等问题。
 type GrayService struct {
-	devices     store.DeviceStore
-	cfg         *config.Config
+	devices store.DeviceStore
+	cfg     *config.Config
+
+	// sharedDevBuf 是型号设备缓存，跨调用共享，受 bufMu 保护。
+	bufMu        sync.RWMutex
 	sharedDevBuf []*model.Device
 	bufModelID   string
-	sharedStrBuf []string
-	scratchHits  []*model.Device
-	scratchMiss  []*model.Device
 }
 
 func NewGrayService(ds store.DeviceStore, cfg *config.Config) *GrayService {
@@ -36,9 +43,6 @@ func NewGrayService(ds store.DeviceStore, cfg *config.Config) *GrayService {
 		devices:      ds,
 		cfg:          cfg,
 		sharedDevBuf: make([]*model.Device, 0, 4096),
-		sharedStrBuf: make([]string, 0, 4096),
-		scratchHits:  make([]*model.Device, 0, 4096),
-		scratchMiss:  make([]*model.Device, 0, 4096),
 	}
 }
 
@@ -47,17 +51,26 @@ func (g *GrayService) PrimeDeviceBuffer(ctx context.Context, modelID string) ([]
 	if err != nil {
 		return nil, err
 	}
-	g.sharedDevBuf = g.sharedDevBuf[:0]
-	g.sharedDevBuf = append(g.sharedDevBuf, list...)
+	buf := make([]*model.Device, 0, len(list))
+	buf = append(buf, list...)
+	g.bufMu.Lock()
+	g.sharedDevBuf = buf
 	g.bufModelID = modelID
-	return g.sharedDevBuf, nil
+	g.bufMu.Unlock()
+	return buf, nil
 }
 
+// viewCachedModelDevices 返回型号缓存设备的拷贝。返回独立切片，调用方可安全
+// 读写而不会影响缓存或其它并发调用。
 func (g *GrayService) viewCachedModelDevices(modelID string) []*model.Device {
-	if g.bufModelID == modelID {
-		return g.sharedDevBuf
+	g.bufMu.RLock()
+	defer g.bufMu.RUnlock()
+	if g.bufModelID != modelID {
+		return nil
 	}
-	return nil
+	out := make([]*model.Device, len(g.sharedDevBuf))
+	copy(out, g.sharedDevBuf)
+	return out
 }
 
 func (g *GrayService) IsHit(task *model.UpgradeTask, device *model.Device, allowList []string) GrayResult {
@@ -124,8 +137,9 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 	for _, id := range task.DeviceIDs {
 		allowMap[id] = struct{}{}
 	}
+	// 注意：pool 可能来自缓存，必须构造独立切片过滤，避免别名改写缓存。
 	if len(task.GroupFilter) > 0 {
-		filtered := pool[:0]
+		filtered := make([]*model.Device, 0, len(pool))
 		for _, d := range pool {
 			if inSlice(task.GroupFilter, d.Group) {
 				filtered = append(filtered, d)
@@ -136,7 +150,7 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 		pool = filtered
 	}
 	if task.FromVersion != "" {
-		filtered := pool[:0]
+		filtered := make([]*model.Device, 0, len(pool))
 		for _, d := range pool {
 			if d.CurrentVersion == task.FromVersion {
 				filtered = append(filtered, d)
@@ -146,8 +160,9 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 		}
 		pool = filtered
 	}
-	hit = g.scratchHits[:0]
-	localMiss := g.scratchMiss[:0]
+	// 局部缓冲：每次调用独立，杜绝并发 DATA RACE 与越界。
+	hit = make([]*model.Device, 0, len(pool))
+	localMiss := make([]*model.Device, 0, len(pool))
 	for _, d := range pool {
 		res := g.IsHit(task, d, task.DeviceIDs)
 		if res.Hit {
@@ -170,42 +185,42 @@ func (g *GrayService) SampleByRatio(candidates []string, seed string, ratio int)
 		copy(out, candidates)
 		return out
 	}
-	buf := g.sharedStrBuf[:0]
+	buf := make([]string, 0, len(candidates))
 	for _, c := range candidates {
 		if stableBucket(seed+"|"+c, 100) < ratio {
 			buf = append(buf, c)
 		}
 	}
-	out := make([]string, len(buf))
-	copy(out, buf)
+	return buf
+}
+
+// SampleIDsIntoShared 返回按比例采样的设备 ID 切片。
+// 历史上复用实例级共享字符串缓冲以减少分配，但在并发批量创建场景下会引发
+// DATA RACE 与跨任务别名污染（同一设备被重复分配）。改为返回独立切片。
+func (g *GrayService) SampleIDsIntoShared(candidates []string, seed string, ratio int) []string {
+	if ratio <= 0 {
+		return []string{}
+	}
+	if ratio >= 100 {
+		out := make([]string, len(candidates))
+		copy(out, candidates)
+		return out
+	}
+	out := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if stableBucket(seed+"|"+c, 100) < ratio {
+			out = append(out, c)
+		}
+	}
 	return out
 }
 
-func (g *GrayService) SampleIDsIntoShared(candidates []string, seed string, ratio int) []string {
-	if ratio <= 0 {
-		g.sharedStrBuf = g.sharedStrBuf[:0]
-		return g.sharedStrBuf
-	}
-	if ratio >= 100 {
-		g.sharedStrBuf = g.sharedStrBuf[:0]
-		g.sharedStrBuf = append(g.sharedStrBuf, candidates...)
-		return g.sharedStrBuf
-	}
-	g.sharedStrBuf = g.sharedStrBuf[:0]
-	for _, c := range candidates {
-		if stableBucket(seed+"|"+c, 100) < ratio {
-			g.sharedStrBuf = append(g.sharedStrBuf, c)
-		}
-	}
-	return g.sharedStrBuf
-}
-
 func (g *GrayService) ExtractIDs(pool []*model.Device) []string {
-	g.sharedStrBuf = g.sharedStrBuf[:0]
+	out := make([]string, 0, len(pool))
 	for _, d := range pool {
-		g.sharedStrBuf = append(g.sharedStrBuf, d.ID)
+		out = append(out, d.ID)
 	}
-	return g.sharedStrBuf
+	return out
 }
 
 func (g *GrayService) RandomSample(candidates []string, n int) []string {
