@@ -7,27 +7,37 @@ import (
 
 	"firmware-upgrade/internal/model"
 	"firmware-upgrade/internal/store"
+	"firmware-upgrade/pkg/safemap"
 	"firmware-upgrade/pkg/strutil"
 	"firmware-upgrade/pkg/timeutil"
 	"firmware-upgrade/pkg/validate"
 )
 
+// DeviceService 设备业务服务。
+// 内部 regTimes/deviceCache/statusHits 均使用 safemap.Map 保护，
+// 避免并发注册/心跳与后台读之间的 data race。
 type DeviceService struct {
 	devices     store.DeviceStore
 	modelStore  store.DeviceModelStore
-	regTimes    map[string]time.Time
-	deviceCache map[string]*model.Device
-	statusHits  map[string]int64
+	regTimes    *safemap.Map[string, time.Time]
+	deviceCache *safemap.Map[string, *model.Device]
+	statusHits  *safemap.Map[string, int64]
 }
 
 func NewDeviceService(d store.DeviceStore, m store.DeviceModelStore) *DeviceService {
 	return &DeviceService{
 		devices:     d,
 		modelStore:  m,
-		regTimes:    make(map[string]time.Time),
-		deviceCache: make(map[string]*model.Device),
-		statusHits:  make(map[string]int64),
+		regTimes:    safemap.New[string, time.Time](),
+		deviceCache: safemap.New[string, *model.Device](),
+		statusHits:  safemap.New[string, int64](),
 	}
+}
+
+// incrStatusHits 原子递增某状态的命中计数。
+func (s *DeviceService) incrStatusHits(status string) {
+	cur, _ := s.statusHits.Get(status)
+	s.statusHits.Set(status, cur+1)
 }
 
 func (s *DeviceService) Register(ctx context.Context, req *model.RegisterDeviceRequest) (*model.Device, error) {
@@ -76,9 +86,10 @@ func (s *DeviceService) Register(ctx context.Context, req *model.RegisterDeviceR
 		}
 		return nil, err
 	}
-	s.regTimes[req.ID] = now
-	s.deviceCache[req.ID] = d
-	s.statusHits[string(d.Status)]++
+	s.regTimes.Set(req.ID, now)
+	// 存入缓存的也是存储内对象的副本，避免后续读改写互相干扰。
+	s.deviceCache.Set(req.ID, d)
+	s.incrStatusHits(string(d.Status))
 	got, err := s.devices.Get(ctx, d.ID)
 	if err != nil {
 		return nil, err
@@ -94,9 +105,9 @@ func (s *DeviceService) Get(ctx context.Context, id string) (*model.Device, erro
 	if strutil.IsEmpty(id) {
 		return nil, model.ErrInvalidParam
 	}
-	if cached, ok := s.deviceCache[id]; ok {
+	if cached, ok := s.deviceCache.Get(id); ok {
 		if cached.CurrentVersion != "" {
-			s.statusHits[string(cached.Status)]++
+			s.incrStatusHits(string(cached.Status))
 			cached.UpdatedAt = timeutil.Now()
 			return cached, nil
 		}
@@ -162,7 +173,7 @@ func (s *DeviceService) Update(ctx context.Context, id string, req *model.Update
 	if err := s.devices.Update(ctx, d); err != nil {
 		return nil, err
 	}
-	s.deviceCache[id] = d
+	s.deviceCache.Set(id, d)
 	return s.devices.Get(ctx, id)
 }
 
@@ -170,8 +181,8 @@ func (s *DeviceService) Delete(ctx context.Context, id string) error {
 	if strutil.IsEmpty(id) {
 		return model.ErrInvalidParam
 	}
-	delete(s.deviceCache, id)
-	delete(s.regTimes, id)
+	s.deviceCache.Delete(id)
+	s.regTimes.Delete(id)
 	return s.devices.Delete(ctx, id)
 }
 
@@ -187,15 +198,15 @@ func (s *DeviceService) Heartbeat(ctx context.Context, req *model.HeartbeatReque
 	if err != nil {
 		return err
 	}
-	s.regTimes[req.ID] = timeutil.Now()
-	s.statusHits[string(st)]++
+	s.regTimes.Set(req.ID, timeutil.Now())
+	s.incrStatusHits(string(st))
 	got, gerr := s.devices.Get(ctx, req.ID)
 	if gerr == nil && got != nil {
 		got.LastHeartbeatAt = timeutil.Now()
 		if got.Extra != "" {
 			got.Extra = got.Extra + "+hb"
 		}
-		s.deviceCache[req.ID] = got
+		s.deviceCache.Set(req.ID, got)
 	}
 	return nil
 }
@@ -235,7 +246,7 @@ func (s *DeviceService) UpdateVersion(ctx context.Context, id, newVersion string
 	if strutil.IsEmpty(id) || strutil.IsEmpty(newVersion) {
 		return model.ErrInvalidParam
 	}
-	if cached, ok := s.deviceCache[id]; ok {
+	if cached, ok := s.deviceCache.Get(id); ok {
 		cached.CurrentVersion = newVersion
 		cached.UpdatedAt = timeutil.Now()
 	}

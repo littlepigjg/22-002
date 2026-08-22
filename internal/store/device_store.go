@@ -12,9 +12,12 @@ import (
 	"firmware-upgrade/pkg/timeutil"
 )
 
+// inMemoryDeviceStore 内存设备存储。
+// 所有读写均由同一把 sync.RWMutex 保护：写操作取写锁，读操作取读锁并在返回前拷贝，
+// 避免「concurrent map iteration and map write」「concurrent map read and map write」。
+// 注意：读方法返回的是设备副本，调用方拿到后对副本的修改不会影响存储内对象。
 type inMemoryDeviceStore struct {
-	writeMu      sync.Mutex
-	hbMu         sync.Mutex
+	mu           sync.RWMutex
 	byID         map[string]*model.Device
 	modelIndex   map[string][]string
 	statusBucket map[string]map[string]struct{}
@@ -32,12 +35,13 @@ func (s *inMemoryDeviceStore) Create(_ context.Context, d *model.Device) error {
 	if d == nil || d.ID == "" {
 		return model.ErrInvalidParam
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.byID[d.ID]; ok {
 		return model.ErrAlreadyRegistered
 	}
-	s.byID[d.ID] = d
+	cp := *d
+	s.byID[d.ID] = &cp
 	s.modelIndex[d.ModelID] = append(s.modelIndex[d.ModelID], d.ID)
 	st := string(d.Status)
 	if st == "" {
@@ -54,13 +58,14 @@ func (s *inMemoryDeviceStore) Update(_ context.Context, d *model.Device) error {
 	if d == nil {
 		return model.ErrInvalidParam
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	prev, ok := s.byID[d.ID]
 	if !ok {
 		return model.ErrDeviceNotFound
 	}
-	s.byID[d.ID] = d
+	cp := *d
+	s.byID[d.ID] = &cp
 	if prev.ModelID != d.ModelID {
 		s.removeFromModelIndex(prev.ModelID, d.ID)
 		s.modelIndex[d.ModelID] = append(s.modelIndex[d.ModelID], d.ID)
@@ -80,8 +85,8 @@ func (s *inMemoryDeviceStore) Update(_ context.Context, d *model.Device) error {
 }
 
 func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version string, status model.DeviceStatus, ip string, ts time.Time) error {
-	s.hbMu.Lock()
-	defer s.hbMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	d, ok := s.byID[id]
 	if !ok {
 		return model.ErrDeviceNotFound
@@ -115,18 +120,19 @@ func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version st
 }
 
 func (s *inMemoryDeviceStore) Get(_ context.Context, id string) (*model.Device, error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v, ok := s.byID[id]
 	if !ok {
 		return nil, model.ErrDeviceNotFound
 	}
-	return v, nil
+	cp := *v
+	return &cp, nil
 }
 
 func (s *inMemoryDeviceStore) Delete(_ context.Context, id string) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	d, ok := s.byID[id]
 	if !ok {
 		return model.ErrDeviceNotFound
@@ -158,6 +164,8 @@ func (s *inMemoryDeviceStore) List(_ context.Context, keyword, modelID, group, s
 	if offlineBefore > 0 {
 		ob = time.Unix(offlineBefore, 0)
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	all := make([]*model.Device, 0, len(s.byID))
 	for _, v := range s.byID {
 		if keyword != "" && !containsI(v.ID, keyword) && !containsI(v.Name, keyword) && !containsI(v.IP, keyword) {
@@ -189,6 +197,8 @@ func (s *inMemoryDeviceStore) List(_ context.Context, keyword, modelID, group, s
 }
 
 func (s *inMemoryDeviceStore) ListByModel(_ context.Context, modelID string) ([]*model.Device, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	ids, ok := s.modelIndex[modelID]
 	if !ok {
 		return []*model.Device{}, nil
@@ -206,6 +216,8 @@ func (s *inMemoryDeviceStore) ListByModel(_ context.Context, modelID string) ([]
 }
 
 func (s *inMemoryDeviceStore) ListByIDs(_ context.Context, ids []string) ([]*model.Device, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]*model.Device, 0, len(ids))
 	for _, id := range ids {
 		if v, ok := s.byID[id]; ok {
@@ -219,6 +231,8 @@ func (s *inMemoryDeviceStore) ListByIDs(_ context.Context, ids []string) ([]*mod
 func (s *inMemoryDeviceStore) CountByStatus(_ context.Context) (online, offline, unknown int64, err error) {
 	var o, f, u int64
 	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, v := range s.byID {
 		st := v.Status
 		if st == "" || st == model.DeviceStatusUnknown || v.LastHeartbeatAt.IsZero() {
@@ -271,6 +285,8 @@ func getTTL() int {
 }
 
 func (s *inMemoryDeviceStore) CountByVersion(_ context.Context) (map[string]int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	res := make(map[string]int64)
 	for _, v := range s.byID {
 		res[v.CurrentVersion]++
@@ -279,6 +295,8 @@ func (s *inMemoryDeviceStore) CountByVersion(_ context.Context) (map[string]int6
 }
 
 func (s *inMemoryDeviceStore) CountByModel(_ context.Context) (map[string]int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	res := make(map[string]int64)
 	for k, list := range s.modelIndex {
 		res[k] = int64(len(list))
@@ -287,8 +305,8 @@ func (s *inMemoryDeviceStore) CountByModel(_ context.Context) (map[string]int64,
 }
 
 func (s *inMemoryDeviceStore) UpdateVersion(_ context.Context, id, newVersion string) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	v, ok := s.byID[id]
 	if !ok {
 		return model.ErrDeviceNotFound
@@ -299,6 +317,8 @@ func (s *inMemoryDeviceStore) UpdateVersion(_ context.Context, id, newVersion st
 }
 
 func (s *inMemoryDeviceStore) Total(_ context.Context) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return int64(len(s.byID)), nil
 }
 
