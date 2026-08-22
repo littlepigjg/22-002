@@ -125,7 +125,10 @@ func (s *inMemoryTaskExecStore) UpdateProgress(_ context.Context, taskID, device
 	if progress > 100 {
 		progress = 100
 	}
-	v.Progress = progress
+	// 进度只前进不后退：乱序/迟到的上报不应把已完成的进度写回更低值。
+	if progress > v.Progress {
+		v.Progress = progress
+	}
 	if !ts.IsZero() {
 		v.LastReportAt = ts
 	}

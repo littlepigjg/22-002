@@ -65,7 +65,10 @@ func (p *ProgressService) applyHistoryUpdates(h *model.UpgradeHistory, req *mode
 		return
 	}
 	h.Status = req.Status
-	h.Progress = req.Progress
+	// 进度只前进不后退：避免迟到/乱序的上报把已到 100 的进度写回 0。
+	if req.Progress > h.Progress {
+		h.Progress = req.Progress
+	}
 	if req.ErrorMessage != "" {
 		h.ErrorMessage = req.ErrorMessage
 	}
@@ -121,10 +124,13 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 	default:
 		return nil, errors.New("invalid upgrade status")
 	}
-	pc := p.precheckReport(ctx, req)
+	// 先取设备锁，再读 history：同一设备的并发上报在此串行化，
+	// precheckReport 读到的 history 副本必为最新已落库值，避免 RetryCount
+	// 因读旧副本而丢失。
 	lock := p.deviceLock(req.DeviceID)
 	lock.Lock()
 	defer lock.Unlock()
+	pc := p.precheckReport(ctx, req)
 	if pc.taskErr != nil {
 		return nil, pc.taskErr
 	}
@@ -188,10 +194,9 @@ func (p *ProgressService) collectTimeoutCandidates(ctx context.Context, t *model
 			deviceID: e.DeviceID,
 			progress: e.Progress,
 		}
-		if h, err := p.histories.FindLatestByDevice(ctx, e.DeviceID, t.ID); err == nil {
-			c.history = h
-			c.hasHist = true
-		}
+		// 不在此处读 history：此函数在设备锁外执行，读到的 history 副本可能
+		// 与并发 Report 交错。history 改在 ScanTimeout 取到设备锁后现读，
+		// 保证与 Report 路径串行化。
 		out = append(out, c)
 	}
 	return out
@@ -231,9 +236,11 @@ func (p *ProgressService) ScanTimeout(ctx context.Context) int {
 				dlock.Unlock()
 				continue
 			}
-			if c.hasHist && c.history != nil {
-				p.applyTimeoutHistory(c.history, now)
-				_ = p.histories.Update(ctx, c.history)
+			// 设备锁内现读 history，确保与 Report 路径串行化，
+			// 拿到最新 RetryCount/Progress 后再回写超时终态。
+			if h, err := p.histories.FindLatestByDevice(ctx, c.deviceID, t.ID); err == nil && h != nil {
+				p.applyTimeoutHistory(h, now)
+				_ = p.histories.Update(ctx, h)
 			}
 			dlock.Unlock()
 			handled++

@@ -61,12 +61,14 @@ func (s *inMemoryHistoryStore) Create(_ context.Context, h *model.UpgradeHistory
 		s.byDay[day] = append(s.byDay[day], h.ID)
 	}
 	s.mu.Unlock()
+	// 删除缓存必须在写锁下完成：delete 属于 map 写，RLock 下并发读会触发
+	// "concurrent map read and map write" 崩溃。
 	k1 := historyCacheKey(h.DeviceID, h.TaskID)
 	k2 := historyCacheKey(h.DeviceID, "")
-	s.cacheMu.RLock()
+	s.cacheMu.Lock()
 	delete(s.latestCache, k1)
 	delete(s.latestCache, k2)
-	s.cacheMu.RUnlock()
+	s.cacheMu.Unlock()
 	return nil
 }
 
@@ -82,33 +84,21 @@ func (s *inMemoryHistoryStore) Update(_ context.Context, h *model.UpgradeHistory
 	cp := *h
 	s.data[h.ID] = &cp
 	s.mu.Unlock()
+	// 缓存更新必须在写锁下完成。缓存条目是不可变快照：
+	// 整体替换为最新副本，禁止原地修改缓存字段，否则与读端 cp := *cached
+	// 产生字段级 data race。
 	key := historyCacheKey(h.DeviceID, h.TaskID)
-	s.cacheMu.RLock()
-	if cached, cok := s.latestCache[key]; cok && cached != nil && cached.ID == h.ID {
-		cached.Status = h.Status
-		cached.Progress = h.Progress
-		if h.ErrorMessage != "" {
-			cached.ErrorMessage = h.ErrorMessage
-		}
-		if !h.FinishedAt.IsZero() {
-			cached.FinishedAt = h.FinishedAt
-			cached.DurationMs = h.DurationMs
-		}
-		if h.DownloadSpeed > 0 {
-			cached.DownloadSpeed = h.DownloadSpeed
-		}
-		cached.MD5Verified = h.MD5Verified
-		cached.RetryCount = h.RetryCount
-	}
 	blankKey := historyCacheKey(h.DeviceID, "")
-	if cached2, cok2 := s.latestCache[blankKey]; cok2 && cached2 != nil && cached2.ID == h.ID {
-		cached2.Status = h.Status
-		cached2.Progress = h.Progress
-		if h.ErrorMessage != "" {
-			cached2.ErrorMessage = h.ErrorMessage
-		}
+	s.cacheMu.Lock()
+	if cached, cok := s.latestCache[key]; cok && cached != nil && cached.ID == h.ID {
+		snap := *h
+		s.latestCache[key] = &snap
 	}
-	s.cacheMu.RUnlock()
+	if cached2, cok2 := s.latestCache[blankKey]; cok2 && cached2 != nil && cached2.ID == h.ID {
+		snap2 := *h
+		s.latestCache[blankKey] = &snap2
+	}
+	s.cacheMu.Unlock()
 	return nil
 }
 
@@ -159,10 +149,12 @@ func (s *inMemoryHistoryStore) FindLatestByDevice(_ context.Context, deviceID, t
 		return nil, model.ErrNotFound
 	}
 	out := *latest
-	cp := *latest
-	s.cacheMu.RLock()
-	s.latestCache[key] = &cp
-	s.cacheMu.RUnlock()
+	// 回填缓存是 map 写，必须用写锁，RLock 下写会触发
+	// "concurrent map read and map write" 崩溃。
+	snap := *latest
+	s.cacheMu.Lock()
+	s.latestCache[key] = &snap
+	s.cacheMu.Unlock()
 	return &out, nil
 }
 
