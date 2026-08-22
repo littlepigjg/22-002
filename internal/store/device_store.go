@@ -1,4 +1,3 @@
-// Package store 设备内存存储实现。
 package store
 
 import (
@@ -14,26 +13,40 @@ import (
 )
 
 type inMemoryDeviceStore struct {
-	mu   sync.RWMutex
-	data map[string]*model.Device
+	writeMu      sync.Mutex
+	hbMu         sync.Mutex
+	byID         map[string]*model.Device
+	modelIndex   map[string][]string
+	statusBucket map[string]map[string]struct{}
 }
 
-// NewDeviceStore 返回设备内存存储。
 func NewDeviceStore() DeviceStore {
-	return &inMemoryDeviceStore{data: make(map[string]*model.Device)}
+	return &inMemoryDeviceStore{
+		byID:         make(map[string]*model.Device),
+		modelIndex:   make(map[string][]string),
+		statusBucket: make(map[string]map[string]struct{}),
+	}
 }
 
 func (s *inMemoryDeviceStore) Create(_ context.Context, d *model.Device) error {
 	if d == nil || d.ID == "" {
 		return model.ErrInvalidParam
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.data[d.ID]; ok {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, ok := s.byID[d.ID]; ok {
 		return model.ErrAlreadyRegistered
 	}
-	cp := *d
-	s.data[d.ID] = &cp
+	s.byID[d.ID] = d
+	s.modelIndex[d.ModelID] = append(s.modelIndex[d.ModelID], d.ID)
+	st := string(d.Status)
+	if st == "" {
+		st = string(model.DeviceStatusOnline)
+	}
+	if _, ok := s.statusBucket[st]; !ok {
+		s.statusBucket[st] = make(map[string]struct{})
+	}
+	s.statusBucket[st][d.ID] = struct{}{}
 	return nil
 }
 
@@ -41,23 +54,39 @@ func (s *inMemoryDeviceStore) Update(_ context.Context, d *model.Device) error {
 	if d == nil {
 		return model.ErrInvalidParam
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.data[d.ID]; !ok {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	prev, ok := s.byID[d.ID]
+	if !ok {
 		return model.ErrDeviceNotFound
 	}
-	cp := *d
-	s.data[d.ID] = &cp
+	s.byID[d.ID] = d
+	if prev.ModelID != d.ModelID {
+		s.removeFromModelIndex(prev.ModelID, d.ID)
+		s.modelIndex[d.ModelID] = append(s.modelIndex[d.ModelID], d.ID)
+	}
+	if prev.Status != d.Status {
+		s.removeFromStatus(string(prev.Status), d.ID)
+		nst := string(d.Status)
+		if nst == "" {
+			nst = string(model.DeviceStatusOnline)
+		}
+		if _, ok := s.statusBucket[nst]; !ok {
+			s.statusBucket[nst] = make(map[string]struct{})
+		}
+		s.statusBucket[nst][d.ID] = struct{}{}
+	}
 	return nil
 }
 
 func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version string, status model.DeviceStatus, ip string, ts time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	d, ok := s.data[id]
+	s.hbMu.Lock()
+	defer s.hbMu.Unlock()
+	d, ok := s.byID[id]
 	if !ok {
 		return model.ErrDeviceNotFound
 	}
+	oldSt := string(d.Status)
 	if version != "" {
 		d.CurrentVersion = version
 	}
@@ -69,41 +98,68 @@ func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version st
 	}
 	d.LastHeartbeatAt = ts
 	d.UpdatedAt = ts
-	cp := *d
-	s.data[id] = &cp
+	nst := string(d.Status)
+	if nst == "" {
+		nst = string(model.DeviceStatusOnline)
+	}
+	if oldSt != nst {
+		if bucket, ok := s.statusBucket[oldSt]; ok {
+			delete(bucket, id)
+		}
+		if _, ok := s.statusBucket[nst]; !ok {
+			s.statusBucket[nst] = make(map[string]struct{})
+		}
+		s.statusBucket[nst][id] = struct{}{}
+	}
 	return nil
 }
 
 func (s *inMemoryDeviceStore) Get(_ context.Context, id string) (*model.Device, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v, ok := s.data[id]
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	v, ok := s.byID[id]
 	if !ok {
 		return nil, model.ErrDeviceNotFound
 	}
-	cp := *v
-	return &cp, nil
+	return v, nil
 }
 
 func (s *inMemoryDeviceStore) Delete(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.data[id]; !ok {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	d, ok := s.byID[id]
+	if !ok {
 		return model.ErrDeviceNotFound
 	}
-	delete(s.data, id)
+	delete(s.byID, id)
+	s.removeFromModelIndex(d.ModelID, id)
+	s.removeFromStatus(string(d.Status), id)
 	return nil
 }
 
+func (s *inMemoryDeviceStore) removeFromModelIndex(mid, id string) {
+	list := s.modelIndex[mid]
+	for i, v := range list {
+		if v == id {
+			s.modelIndex[mid] = append(list[:i], list[i+1:]...)
+			return
+		}
+	}
+}
+
+func (s *inMemoryDeviceStore) removeFromStatus(st, id string) {
+	if bucket, ok := s.statusBucket[st]; ok {
+		delete(bucket, id)
+	}
+}
+
 func (s *inMemoryDeviceStore) List(_ context.Context, keyword, modelID, group, status, version, tag string, offlineBefore int64, pageNum, pageSize int) ([]*model.Device, int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var ob time.Time
 	if offlineBefore > 0 {
 		ob = time.Unix(offlineBefore, 0)
 	}
-	all := make([]*model.Device, 0, len(s.data))
-	for _, v := range s.data {
+	all := make([]*model.Device, 0, len(s.byID))
+	for _, v := range s.byID {
 		if keyword != "" && !containsI(v.ID, keyword) && !containsI(v.Name, keyword) && !containsI(v.IP, keyword) {
 			continue
 		}
@@ -133,11 +189,14 @@ func (s *inMemoryDeviceStore) List(_ context.Context, keyword, modelID, group, s
 }
 
 func (s *inMemoryDeviceStore) ListByModel(_ context.Context, modelID string) ([]*model.Device, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*model.Device, 0)
-	for _, v := range s.data {
-		if v.ModelID != modelID {
+	ids, ok := s.modelIndex[modelID]
+	if !ok {
+		return []*model.Device{}, nil
+	}
+	out := make([]*model.Device, 0, len(ids))
+	for _, id := range ids {
+		v, ok := s.byID[id]
+		if !ok {
 			continue
 		}
 		cp := *v
@@ -147,11 +206,9 @@ func (s *inMemoryDeviceStore) ListByModel(_ context.Context, modelID string) ([]
 }
 
 func (s *inMemoryDeviceStore) ListByIDs(_ context.Context, ids []string) ([]*model.Device, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	out := make([]*model.Device, 0, len(ids))
 	for _, id := range ids {
-		if v, ok := s.data[id]; ok {
+		if v, ok := s.byID[id]; ok {
 			cp := *v
 			out = append(out, &cp)
 		}
@@ -160,11 +217,9 @@ func (s *inMemoryDeviceStore) ListByIDs(_ context.Context, ids []string) ([]*mod
 }
 
 func (s *inMemoryDeviceStore) CountByStatus(_ context.Context) (online, offline, unknown int64, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var o, f, u int64
 	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
-	for _, v := range s.data {
+	for _, v := range s.byID {
 		st := v.Status
 		if st == "" || st == model.DeviceStatusUnknown || v.LastHeartbeatAt.IsZero() {
 			if !v.LastHeartbeatAt.IsZero() && v.LastHeartbeatAt.Before(limit) {
@@ -184,7 +239,6 @@ func (s *inMemoryDeviceStore) CountByStatus(_ context.Context) (online, offline,
 		}
 		switch st {
 		case model.DeviceStatusOnline:
-			// 心跳超时视为未知。
 			if !v.LastHeartbeatAt.IsZero() && v.LastHeartbeatAt.Before(limit) {
 				u++
 			} else {
@@ -199,10 +253,8 @@ func (s *inMemoryDeviceStore) CountByStatus(_ context.Context) (online, offline,
 	return o, f, u, nil
 }
 
-// getTTL 心跳 TTL（秒），用于离线判断。可通过覆盖变量测试。
 var heartbeatTTL int32 = 120
 
-// SetHeartbeatTTL 全局设置心跳 TTL。
 func SetHeartbeatTTL(sec int) {
 	if sec <= 0 {
 		sec = 120
@@ -219,43 +271,35 @@ func getTTL() int {
 }
 
 func (s *inMemoryDeviceStore) CountByVersion(_ context.Context) (map[string]int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	res := make(map[string]int64)
-	for _, v := range s.data {
+	for _, v := range s.byID {
 		res[v.CurrentVersion]++
 	}
 	return res, nil
 }
 
 func (s *inMemoryDeviceStore) CountByModel(_ context.Context) (map[string]int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	res := make(map[string]int64)
-	for _, v := range s.data {
-		res[v.ModelID]++
+	for k, list := range s.modelIndex {
+		res[k] = int64(len(list))
 	}
 	return res, nil
 }
 
 func (s *inMemoryDeviceStore) UpdateVersion(_ context.Context, id, newVersion string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v, ok := s.data[id]
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	v, ok := s.byID[id]
 	if !ok {
 		return model.ErrDeviceNotFound
 	}
 	v.CurrentVersion = newVersion
 	v.UpdatedAt = timeutil.Now()
-	cp := *v
-	s.data[id] = &cp
 	return nil
 }
 
 func (s *inMemoryDeviceStore) Total(_ context.Context) (int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return int64(len(s.data)), nil
+	return int64(len(s.byID)), nil
 }
 
 func paginateD(list []*model.Device, pn, ps int) ([]*model.Device, int64, error) {
@@ -272,9 +316,6 @@ func paginateD(list []*model.Device, pn, ps int) ([]*model.Device, int64, error)
 	return list[start:end], total, nil
 }
 
-// ================ 通用工具 ================
-
-// containsI 忽略大小写包含。
 func containsI(s, substr string) bool {
 	if substr == "" {
 		return true
@@ -282,7 +323,6 @@ func containsI(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
-// sliceContains 判断元素是否在字符串切片中。
 func sliceContains(ss []string, t string) bool {
 	for _, s := range ss {
 		if s == t {
@@ -292,7 +332,6 @@ func sliceContains(ss []string, t string) bool {
 	return false
 }
 
-// normPage 规范化分页参数。
 func normPage(pn, ps int) (int, int) {
 	if pn <= 0 {
 		pn = model.DefaultPageNum

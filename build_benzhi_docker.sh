@@ -33,8 +33,11 @@ NO_CACHE=0
 LOAD=0
 PUSH=0
 SAVE=0
+PLATFORM=""
 
 # ---- 解析参数 -----------------------------------------------------------------
+# 位置参数格式：<image_name> <tag> [platform]  (例如: exam-system latest linux/amd64)
+POSITIONAL=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -t|--tag)        TAG="$2";   shift 2 ;;
@@ -44,16 +47,33 @@ while [[ $# -gt 0 ]]; do
     --load)          LOAD=1;     shift ;;
     --push)          PUSH=1;     shift ;;
     --save)          SAVE=1;     shift ;;
+    --platform)      PLATFORM="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,30p' "$0"; exit 0 ;;
-    *)
+    -*)
       echo "未知参数: $1" >&2; exit 2 ;;
+    *)
+      POSITIONAL+=("$1"); shift ;;
   esac
 done
+
+# 处理位置参数
+if [[ ${#POSITIONAL[@]} -ge 1 ]]; then
+  IMAGE_NAME="${POSITIONAL[0]}"
+  TAG_SUFFIX="$(date +%Y%m%d-%H%M%S)"
+  if [[ ${#POSITIONAL[@]} -ge 2 ]]; then
+    TAG_SUFFIX="${POSITIONAL[1]}"
+  fi
+  TAG="${IMAGE_NAME}:${TAG_SUFFIX}"
+  if [[ ${#POSITIONAL[@]} -ge 3 ]]; then
+    PLATFORM="${POSITIONAL[2]}"
+  fi
+fi
 
 echo "[build_benzhi] TAG         = ${TAG}"
 echo "[build_benzhi] DOCKERFILE  = ${DOCKERFILE}"
 echo "[build_benzhi] PROXY       = ${PROXY}"
+echo "[build_benzhi] PLATFORM    = ${PLATFORM:-<host>}"
 echo "[build_benzhi] NO_CACHE    = ${NO_CACHE}"
 echo "[build_benzhi] LOAD/PUSH/SAVE = ${LOAD}/${PUSH}/${SAVE}"
 
@@ -89,7 +109,11 @@ BUILDX_ARGS=()
 if [[ "${NO_CACHE}" -eq 1 ]]; then
   BUILDX_ARGS+=( --no-cache )
 fi
-if [[ "${LOAD}" -eq 1 ]]; then
+if [[ -n "${PLATFORM}" ]]; then
+  BUILDX_ARGS+=( --platform "${PLATFORM}" )
+fi
+# 单平台构建时默认 load 到本地，方便 docker run 使用
+if [[ "${LOAD}" -eq 1 || ("${PUSH}" -eq 0 && -z "${SAVE}" || -n "${PLATFORM}") ]]; then
   BUILDX_ARGS+=( --load )
 fi
 if [[ "${PUSH}" -eq 1 ]]; then

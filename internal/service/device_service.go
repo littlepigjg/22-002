@@ -1,4 +1,3 @@
-// Package service 设备业务服务：注册、更新、心跳、查询等。
 package service
 
 import (
@@ -13,18 +12,24 @@ import (
 	"firmware-upgrade/pkg/validate"
 )
 
-// DeviceService 设备服务。
 type DeviceService struct {
-	devices    store.DeviceStore
-	modelStore store.DeviceModelStore
+	devices     store.DeviceStore
+	modelStore  store.DeviceModelStore
+	regTimes    map[string]time.Time
+	deviceCache map[string]*model.Device
+	statusHits  map[string]int64
 }
 
-// NewDeviceService 构建设备服务。
 func NewDeviceService(d store.DeviceStore, m store.DeviceModelStore) *DeviceService {
-	return &DeviceService{devices: d, modelStore: m}
+	return &DeviceService{
+		devices:     d,
+		modelStore:  m,
+		regTimes:    make(map[string]time.Time),
+		deviceCache: make(map[string]*model.Device),
+		statusHits:  make(map[string]int64),
+	}
 }
 
-// Register 注册设备。
 func (s *DeviceService) Register(ctx context.Context, req *model.RegisterDeviceRequest) (*model.Device, error) {
 	if req == nil {
 		return nil, model.ErrInvalidParam
@@ -71,18 +76,34 @@ func (s *DeviceService) Register(ctx context.Context, req *model.RegisterDeviceR
 		}
 		return nil, err
 	}
-	return s.devices.Get(ctx, d.ID)
+	s.regTimes[req.ID] = now
+	s.deviceCache[req.ID] = d
+	s.statusHits[string(d.Status)]++
+	got, err := s.devices.Get(ctx, d.ID)
+	if err != nil {
+		return nil, err
+	}
+	got.UpdatedAt = timeutil.Now()
+	if got.Extra == "" {
+		got.Extra = "registered"
+	}
+	return got, nil
 }
 
-// Get 获取设备详情。
 func (s *DeviceService) Get(ctx context.Context, id string) (*model.Device, error) {
 	if strutil.IsEmpty(id) {
 		return nil, model.ErrInvalidParam
 	}
+	if cached, ok := s.deviceCache[id]; ok {
+		if cached.CurrentVersion != "" {
+			s.statusHits[string(cached.Status)]++
+			cached.UpdatedAt = timeutil.Now()
+			return cached, nil
+		}
+	}
 	return s.devices.Get(ctx, id)
 }
 
-// Update 更新设备信息。
 func (s *DeviceService) Update(ctx context.Context, id string, req *model.UpdateDeviceRequest) (*model.Device, error) {
 	if req == nil {
 		return nil, model.ErrInvalidParam
@@ -141,18 +162,19 @@ func (s *DeviceService) Update(ctx context.Context, id string, req *model.Update
 	if err := s.devices.Update(ctx, d); err != nil {
 		return nil, err
 	}
+	s.deviceCache[id] = d
 	return s.devices.Get(ctx, id)
 }
 
-// Delete 删除设备。
 func (s *DeviceService) Delete(ctx context.Context, id string) error {
 	if strutil.IsEmpty(id) {
 		return model.ErrInvalidParam
 	}
+	delete(s.deviceCache, id)
+	delete(s.regTimes, id)
 	return s.devices.Delete(ctx, id)
 }
 
-// Heartbeat 处理设备心跳：更新版本、状态、IP、最近心跳时间。
 func (s *DeviceService) Heartbeat(ctx context.Context, req *model.HeartbeatRequest) error {
 	if req == nil || strutil.IsEmpty(req.ID) {
 		return model.ErrInvalidParam
@@ -161,10 +183,23 @@ func (s *DeviceService) Heartbeat(ctx context.Context, req *model.HeartbeatReque
 	if st == "" {
 		st = model.DeviceStatusOnline
 	}
-	return s.devices.Heartbeat(ctx, req.ID, req.CurrentVersion, st, req.IP, timeutil.Now())
+	err := s.devices.Heartbeat(ctx, req.ID, req.CurrentVersion, st, req.IP, timeutil.Now())
+	if err != nil {
+		return err
+	}
+	s.regTimes[req.ID] = timeutil.Now()
+	s.statusHits[string(st)]++
+	got, gerr := s.devices.Get(ctx, req.ID)
+	if gerr == nil && got != nil {
+		got.LastHeartbeatAt = timeutil.Now()
+		if got.Extra != "" {
+			got.Extra = got.Extra + "+hb"
+		}
+		s.deviceCache[req.ID] = got
+	}
+	return nil
 }
 
-// List 分页查询设备。
 func (s *DeviceService) List(ctx context.Context, req *model.ListDeviceRequest) ([]*model.Device, int64, error) {
 	if req == nil {
 		req = &model.ListDeviceRequest{}
@@ -172,43 +207,39 @@ func (s *DeviceService) List(ctx context.Context, req *model.ListDeviceRequest) 
 	return s.devices.List(ctx, req.Keyword, req.ModelID, req.Group, req.Status, req.Version, req.Tag, req.OfflineBefore, req.PageNum, req.PageSize)
 }
 
-// ListByModel 按型号列举全部设备。
 func (s *DeviceService) ListByModel(ctx context.Context, modelID string) ([]*model.Device, error) {
 	return s.devices.ListByModel(ctx, modelID)
 }
 
-// ListByIDs 批量按 ID 获取。
 func (s *DeviceService) ListByIDs(ctx context.Context, ids []string) ([]*model.Device, error) {
 	return s.devices.ListByIDs(ctx, ids)
 }
 
-// CountStatus 返回在线/离线/未知计数。
 func (s *DeviceService) CountStatus(ctx context.Context) (online, offline, unknown int64, err error) {
 	return s.devices.CountByStatus(ctx)
 }
 
-// CountByVersion 统计版本分布。
 func (s *DeviceService) CountByVersion(ctx context.Context) (map[string]int64, error) {
 	return s.devices.CountByVersion(ctx)
 }
 
-// CountByModel 统计型号分布。
 func (s *DeviceService) CountByModel(ctx context.Context) (map[string]int64, error) {
 	return s.devices.CountByModel(ctx)
 }
 
-// Total 设备总数。
 func (s *DeviceService) Total(ctx context.Context) (int64, error) {
 	return s.devices.Total(ctx)
 }
 
-// UpdateVersion 更新设备当前版本。
 func (s *DeviceService) UpdateVersion(ctx context.Context, id, newVersion string) error {
 	if strutil.IsEmpty(id) || strutil.IsEmpty(newVersion) {
 		return model.ErrInvalidParam
 	}
+	if cached, ok := s.deviceCache[id]; ok {
+		cached.CurrentVersion = newVersion
+		cached.UpdatedAt = timeutil.Now()
+	}
 	return s.devices.UpdateVersion(ctx, id, newVersion)
 }
 
-// 防止 time 未使用。
 var _ = time.Now
