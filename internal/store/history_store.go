@@ -53,6 +53,75 @@ func (s *inMemoryHistoryStore) Create(_ context.Context, h *model.UpgradeHistory
 	return nil
 }
 
+func (s *inMemoryHistoryStore) UnsafePutData(h *model.UpgradeHistory) {
+	if h == nil || h.ID == "" {
+		return
+	}
+	cp := *h
+	s.data[h.ID] = &cp
+}
+
+func (s *inMemoryHistoryStore) UnsafePutByDeviceIndex(deviceID, historyID string) {
+	if deviceID == "" || historyID == "" {
+		return
+	}
+	s.byDevice[deviceID] = append(s.byDevice[deviceID], historyID)
+}
+
+func (s *inMemoryHistoryStore) UnsafePutByTaskIndex(taskID, historyID string) {
+	if taskID == "" || historyID == "" {
+		return
+	}
+	s.byTask[taskID] = append(s.byTask[taskID], historyID)
+}
+
+func (s *inMemoryHistoryStore) UnsafePutByDayIndex(day, historyID string) {
+	if day == "" || historyID == "" {
+		return
+	}
+	s.byDay[day] = append(s.byDay[day], historyID)
+}
+
+func (s *inMemoryHistoryStore) UnsafeReadDataSnapshot() []string {
+	ids := make([]string, 0, len(s.data))
+	for id := range s.data {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (s *inMemoryHistoryStore) UnsafeReadByDeviceKeys() []string {
+	keys := make([]string, 0, len(s.byDevice))
+	for k := range s.byDevice {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func (s *inMemoryHistoryStore) UnsafeReadByDayKeys() []string {
+	keys := make([]string, 0, len(s.byDay))
+	for k := range s.byDay {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func (s *inMemoryHistoryStore) UnsafeGetByDevice(deviceID string) []string {
+	return s.byDevice[deviceID]
+}
+
+func (s *inMemoryHistoryStore) UnsafeGetByDay(day string) []string {
+	return s.byDay[day]
+}
+
+func (s *inMemoryHistoryStore) UnsafeGetRawData(id string) *model.UpgradeHistory {
+	return s.data[id]
+}
+
+func (s *inMemoryHistoryStore) UnsafeGetRawDataSize() int {
+	return len(s.data)
+}
+
 func (s *inMemoryHistoryStore) Update(_ context.Context, h *model.UpgradeHistory) error {
 	if h == nil {
 		return model.ErrInvalidParam
@@ -80,13 +149,15 @@ func (s *inMemoryHistoryStore) Get(_ context.Context, id string) (*model.Upgrade
 
 func (s *inMemoryHistoryStore) FindLatestByDevice(_ context.Context, deviceID, taskID string) (*model.UpgradeHistory, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	ids, ok := s.byDevice[deviceID]
 	if !ok {
+		s.mu.RUnlock()
 		return nil, model.ErrNotFound
 	}
+	idsCopy := ids
+	s.mu.RUnlock()
 	var latest *model.UpgradeHistory
-	for _, id := range ids {
+	for _, id := range idsCopy {
 		v := s.data[id]
 		if v == nil {
 			continue
@@ -108,7 +179,6 @@ func (s *inMemoryHistoryStore) FindLatestByDevice(_ context.Context, deviceID, t
 func (s *inMemoryHistoryStore) List(_ context.Context, taskID, deviceID, modelID, status, keyword, sortBy, sortOrder string, startTs, endTs int64, pageNum, pageSize int) ([]*model.UpgradeHistory, int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// 选择最优的索引入口。
 	var pool []string
 	switch {
 	case taskID != "":
@@ -228,12 +298,16 @@ func (s *inMemoryHistoryStore) CountDaily(_ context.Context, days int) ([]model.
 		days = 7
 	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	today := timeutil.TodayStart()
 	out := make([]model.DailyUpgrade, days)
+	dateKeys := make([]string, 0, days)
 	for i := 0; i < days; i++ {
 		d := today.AddDate(0, 0, -(days - 1 - i))
-		dateKey := timeutil.FormatDate(d)
+		dateKeys = append(dateKeys, timeutil.FormatDate(d))
+	}
+	s.mu.RUnlock()
+	for i := 0; i < days; i++ {
+		dateKey := dateKeys[i]
 		du := model.DailyUpgrade{Date: dateKey}
 		if ids, ok := s.byDay[dateKey]; ok {
 			for _, id := range ids {

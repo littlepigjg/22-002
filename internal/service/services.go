@@ -43,6 +43,7 @@ func NewServices(cfg *config.Config, s *store.Container) *Services {
 	svc.Gray = NewGrayService(s.Devices, cfg)
 	svc.Task = NewTaskService(s.Tasks, s.Execs, s.Devices, s.Firmwares, s.Models, svc.Gray, svc.History, svc.Stats, cfg)
 	svc.Progress = NewProgressService(s.Execs, s.Tasks, s.Devices, s.Histories, svc.Stats, cfg)
+	svc.Progress.BindHistory(svc.History)
 	svc.Poll = NewPollService(s.Tasks, s.Execs, s.Devices, s.Firmwares, svc.Gray, svc.Progress, svc.History, cfg)
 	return svc
 }
