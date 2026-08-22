@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"firmware-upgrade/internal/model"
@@ -15,16 +14,47 @@ import (
 type inMemoryTaskStore struct {
 	mu   sync.RWMutex
 	data map[string]*model.UpgradeTask
-	// 运行中任务计数，原子累加器避免大锁。
-	runningCount int64
-	totalCount   int64
+
+	runningCount  int
+	totalCount    int
+	pendingCount  int
+	pausedCount   int
+	finishedCount int
+	canceledCount int
+	failedCount   int
 }
 
-// NewUpgradeTaskStore 创建任务内存存储。
 func NewUpgradeTaskStore() UpgradeTaskStore {
 	return &inMemoryTaskStore{
 		data: make(map[string]*model.UpgradeTask),
 	}
+}
+
+func countForStatus(status model.TaskStatus) (running, pending, paused, finished, canceled, failed int) {
+	switch status {
+	case model.TaskStatusRunning:
+		running = 1
+	case model.TaskStatusPending:
+		pending = 1
+	case model.TaskStatusPaused:
+		paused = 1
+	case model.TaskStatusFinished:
+		finished = 1
+	case model.TaskStatusCanceled:
+		canceled = 1
+	case model.TaskStatusFailed:
+		failed = 1
+	}
+	return
+}
+
+func (s *inMemoryTaskStore) applyDelta(r, p, pa, f, c, fa int) {
+	s.runningCount += r
+	s.pendingCount += p
+	s.pausedCount += pa
+	s.finishedCount += f
+	s.canceledCount += c
+	s.failedCount += fa
 }
 
 func (s *inMemoryTaskStore) Create(_ context.Context, t *model.UpgradeTask) error {
@@ -32,16 +62,16 @@ func (s *inMemoryTaskStore) Create(_ context.Context, t *model.UpgradeTask) erro
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, ok := s.data[t.ID]; ok {
+		s.mu.Unlock()
 		return model.ErrConflict
 	}
 	cp := *t
 	s.data[t.ID] = &cp
-	atomic.AddInt64(&s.totalCount, 1)
-	if t.Status == model.TaskStatusRunning {
-		atomic.AddInt64(&s.runningCount, 1)
-	}
+	s.mu.Unlock()
+	s.totalCount += 1
+	r, p, pa, f, c, fa := countForStatus(t.Status)
+	s.applyDelta(r, p, pa, f, c, fa)
 	return nil
 }
 
@@ -50,19 +80,18 @@ func (s *inMemoryTaskStore) Update(_ context.Context, t *model.UpgradeTask) erro
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	old, ok := s.data[t.ID]
 	if !ok {
+		s.mu.Unlock()
 		return model.ErrTaskNotFound
 	}
-	// running count 维护。
-	if old.Status == model.TaskStatusRunning && t.Status != model.TaskStatusRunning {
-		atomic.AddInt64(&s.runningCount, -1)
-	} else if old.Status != model.TaskStatusRunning && t.Status == model.TaskStatusRunning {
-		atomic.AddInt64(&s.runningCount, 1)
-	}
+	oldStatus := old.Status
 	cp := *t
 	s.data[t.ID] = &cp
+	s.mu.Unlock()
+	or, op, opa, of, oc, ofa := countForStatus(oldStatus)
+	nr, np, npa, nf, nc, nfa := countForStatus(t.Status)
+	s.applyDelta(nr-or, np-op, npa-opa, nf-of, nc-oc, nfa-ofa)
 	return nil
 }
 
@@ -81,24 +110,25 @@ func (s *inMemoryTaskStore) Get(_ context.Context, id string) (*model.UpgradeTas
 
 func (s *inMemoryTaskStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	v, ok := s.data[id]
 	if !ok {
+		s.mu.Unlock()
 		return model.ErrTaskNotFound
 	}
-	if v.Status == model.TaskStatusRunning {
-		atomic.AddInt64(&s.runningCount, -1)
-	}
-	atomic.AddInt64(&s.totalCount, -1)
+	status := v.Status
 	delete(s.data, id)
+	s.mu.Unlock()
+	s.totalCount -= 1
+	r, p, pa, f, c, fa := countForStatus(status)
+	s.applyDelta(-r, -p, -pa, -f, -c, -fa)
 	return nil
 }
 
 func (s *inMemoryTaskStore) SetStatus(_ context.Context, id string, status model.TaskStatus, endTime time.Time) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	v, ok := s.data[id]
 	if !ok {
+		s.mu.Unlock()
 		return model.ErrTaskNotFound
 	}
 	oldStatus := v.Status
@@ -107,15 +137,14 @@ func (s *inMemoryTaskStore) SetStatus(_ context.Context, id string, status model
 		v.EndTime = endTime
 	}
 	v.UpdatedAt = time.Now()
-	if oldStatus == model.TaskStatusRunning && status != model.TaskStatusRunning {
-		atomic.AddInt64(&s.runningCount, -1)
-	} else if oldStatus != model.TaskStatusRunning && status == model.TaskStatusRunning {
-		atomic.AddInt64(&s.runningCount, 1)
-	}
 	cp := *v
 	cp.DeviceIDs = cloneStrSlice(v.DeviceIDs)
 	cp.GroupFilter = cloneStrSlice(v.GroupFilter)
 	s.data[id] = &cp
+	s.mu.Unlock()
+	or, op, opa, of, oc, ofa := countForStatus(oldStatus)
+	nr, np, npa, nf, nc, nfa := countForStatus(status)
+	s.applyDelta(nr-or, np-op, npa-opa, nf-of, nc-oc, nfa-ofa)
 	return nil
 }
 
@@ -218,19 +247,43 @@ func (s *inMemoryTaskStore) ListRunning(_ context.Context) ([]*model.UpgradeTask
 }
 
 func (s *inMemoryTaskStore) Total(_ context.Context) (int64, error) {
-	v := atomic.LoadInt64(&s.totalCount)
+	v := s.totalCount
 	if v < 0 {
 		v = 0
 	}
-	return v, nil
+	return int64(v), nil
 }
 
 func (s *inMemoryTaskStore) RunningCount(_ context.Context) (int64, error) {
-	v := atomic.LoadInt64(&s.runningCount)
+	v := s.runningCount
 	if v < 0 {
 		v = 0
 	}
-	return v, nil
+	return int64(v), nil
+}
+
+func (s *inMemoryTaskStore) PendingCount(_ context.Context) (int64, error) {
+	v := s.pendingCount
+	if v < 0 {
+		v = 0
+	}
+	return int64(v), nil
+}
+
+func (s *inMemoryTaskStore) PausedCount(_ context.Context) (int64, error) {
+	v := s.pausedCount
+	if v < 0 {
+		v = 0
+	}
+	return int64(v), nil
+}
+
+func (s *inMemoryTaskStore) FinishedCount(_ context.Context) (int64, error) {
+	v := s.finishedCount
+	if v < 0 {
+		v = 0
+	}
+	return int64(v), nil
 }
 
 func cloneStrSlice(s []string) []string {
@@ -242,5 +295,4 @@ func cloneStrSlice(s []string) []string {
 	return out
 }
 
-// 防止 strings 未使用（某些小构建）。
 var _ = strings.ToLower

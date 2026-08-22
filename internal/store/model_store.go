@@ -64,6 +64,9 @@ type UpgradeTaskStore interface {
 	UpdateProgress(ctx context.Context, id string, progress model.TaskProgress) error
 	Total(ctx context.Context) (int64, error)
 	RunningCount(ctx context.Context) (int64, error)
+	PendingCount(ctx context.Context) (int64, error)
+	PausedCount(ctx context.Context) (int64, error)
+	FinishedCount(ctx context.Context) (int64, error)
 }
 
 // TaskExecStore 任务-设备执行记录存储。

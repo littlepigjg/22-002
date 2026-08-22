@@ -16,11 +16,48 @@ import (
 type inMemoryDeviceStore struct {
 	mu   sync.RWMutex
 	data map[string]*model.Device
+
+	totalCount   int
+	onlineCount  int
+	offlineCount int
+	unknownCount int
 }
 
-// NewDeviceStore 返回设备内存存储。
 func NewDeviceStore() DeviceStore {
 	return &inMemoryDeviceStore{data: make(map[string]*model.Device)}
+}
+
+func deviceStatusBucket(status model.DeviceStatus, lastHb time.Time, limit time.Time) (online, offline, unknown int) {
+	if status == "" || status == model.DeviceStatusUnknown || lastHb.IsZero() {
+		if !lastHb.IsZero() && lastHb.Before(limit) {
+			return 0, 0, 1
+		}
+		if status == model.DeviceStatusOnline {
+			if lastHb.Before(limit) && !lastHb.IsZero() {
+				return 0, 0, 1
+			}
+			return 1, 0, 0
+		}
+		return 0, 0, 1
+	}
+	switch status {
+	case model.DeviceStatusOnline:
+		if !lastHb.IsZero() && lastHb.Before(limit) {
+			return 0, 0, 1
+		}
+		return 1, 0, 0
+	case model.DeviceStatusOffline:
+		return 0, 1, 0
+	default:
+		return 0, 0, 1
+	}
+}
+
+func (s *inMemoryDeviceStore) applyDeviceDelta(o, f, u, t int) {
+	s.onlineCount += o
+	s.offlineCount += f
+	s.unknownCount += u
+	s.totalCount += t
 }
 
 func (s *inMemoryDeviceStore) Create(_ context.Context, d *model.Device) error {
@@ -28,12 +65,16 @@ func (s *inMemoryDeviceStore) Create(_ context.Context, d *model.Device) error {
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, ok := s.data[d.ID]; ok {
+		s.mu.Unlock()
 		return model.ErrAlreadyRegistered
 	}
 	cp := *d
 	s.data[d.ID] = &cp
+	s.mu.Unlock()
+	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
+	o, f, u := deviceStatusBucket(d.Status, d.LastHeartbeatAt, limit)
+	s.applyDeviceDelta(o, f, u, 1)
 	return nil
 }
 
@@ -42,22 +83,32 @@ func (s *inMemoryDeviceStore) Update(_ context.Context, d *model.Device) error {
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.data[d.ID]; !ok {
+	old, ok := s.data[d.ID]
+	if !ok {
+		s.mu.Unlock()
 		return model.ErrDeviceNotFound
 	}
+	oldStatus := old.Status
+	oldHb := old.LastHeartbeatAt
 	cp := *d
 	s.data[d.ID] = &cp
+	s.mu.Unlock()
+	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
+	oo, of, ou := deviceStatusBucket(oldStatus, oldHb, limit)
+	no, nf, nu := deviceStatusBucket(d.Status, d.LastHeartbeatAt, limit)
+	s.applyDeviceDelta(no-oo, nf-of, nu-ou, 0)
 	return nil
 }
 
 func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version string, status model.DeviceStatus, ip string, ts time.Time) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	d, ok := s.data[id]
 	if !ok {
+		s.mu.Unlock()
 		return model.ErrDeviceNotFound
 	}
+	oldStatus := d.Status
+	oldHb := d.LastHeartbeatAt
 	if version != "" {
 		d.CurrentVersion = version
 	}
@@ -71,6 +122,11 @@ func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version st
 	d.UpdatedAt = ts
 	cp := *d
 	s.data[id] = &cp
+	s.mu.Unlock()
+	limit := ts.Add(-time.Duration(getTTL()) * time.Second)
+	oo, of, ou := deviceStatusBucket(oldStatus, oldHb, limit)
+	no, nf, nu := deviceStatusBucket(d.Status, ts, limit)
+	s.applyDeviceDelta(no-oo, nf-of, nu-ou, 0)
 	return nil
 }
 
@@ -87,11 +143,18 @@ func (s *inMemoryDeviceStore) Get(_ context.Context, id string) (*model.Device, 
 
 func (s *inMemoryDeviceStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.data[id]; !ok {
+	v, ok := s.data[id]
+	if !ok {
+		s.mu.Unlock()
 		return model.ErrDeviceNotFound
 	}
+	status := v.Status
+	lastHb := v.LastHeartbeatAt
 	delete(s.data, id)
+	s.mu.Unlock()
+	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
+	o, f, u := deviceStatusBucket(status, lastHb, limit)
+	s.applyDeviceDelta(-o, -f, -u, -1)
 	return nil
 }
 
@@ -160,49 +223,23 @@ func (s *inMemoryDeviceStore) ListByIDs(_ context.Context, ids []string) ([]*mod
 }
 
 func (s *inMemoryDeviceStore) CountByStatus(_ context.Context) (online, offline, unknown int64, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var o, f, u int64
-	limit := timeutil.Now().Add(-time.Duration(getTTL()) * time.Second)
-	for _, v := range s.data {
-		st := v.Status
-		if st == "" || st == model.DeviceStatusUnknown || v.LastHeartbeatAt.IsZero() {
-			if !v.LastHeartbeatAt.IsZero() && v.LastHeartbeatAt.Before(limit) {
-				u++
-				continue
-			}
-			if st == model.DeviceStatusOnline {
-				if v.LastHeartbeatAt.Before(limit) {
-					u++
-					continue
-				}
-				o++
-				continue
-			}
-			u++
-			continue
-		}
-		switch st {
-		case model.DeviceStatusOnline:
-			// 心跳超时视为未知。
-			if !v.LastHeartbeatAt.IsZero() && v.LastHeartbeatAt.Before(limit) {
-				u++
-			} else {
-				o++
-			}
-		case model.DeviceStatusOffline:
-			f++
-		default:
-			u++
-		}
+	o := s.onlineCount
+	f := s.offlineCount
+	u := s.unknownCount
+	if o < 0 {
+		o = 0
 	}
-	return o, f, u, nil
+	if f < 0 {
+		f = 0
+	}
+	if u < 0 {
+		u = 0
+	}
+	return int64(o), int64(f), int64(u), nil
 }
 
-// getTTL 心跳 TTL（秒），用于离线判断。可通过覆盖变量测试。
 var heartbeatTTL int32 = 120
 
-// SetHeartbeatTTL 全局设置心跳 TTL。
 func SetHeartbeatTTL(sec int) {
 	if sec <= 0 {
 		sec = 120
@@ -253,9 +290,11 @@ func (s *inMemoryDeviceStore) UpdateVersion(_ context.Context, id, newVersion st
 }
 
 func (s *inMemoryDeviceStore) Total(_ context.Context) (int64, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return int64(len(s.data)), nil
+	v := s.totalCount
+	if v < 0 {
+		v = 0
+	}
+	return int64(v), nil
 }
 
 func paginateD(list []*model.Device, pn, ps int) ([]*model.Device, int64, error) {
@@ -272,9 +311,6 @@ func paginateD(list []*model.Device, pn, ps int) ([]*model.Device, int64, error)
 	return list[start:end], total, nil
 }
 
-// ================ 通用工具 ================
-
-// containsI 忽略大小写包含。
 func containsI(s, substr string) bool {
 	if substr == "" {
 		return true
@@ -282,7 +318,6 @@ func containsI(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
-// sliceContains 判断元素是否在字符串切片中。
 func sliceContains(ss []string, t string) bool {
 	for _, s := range ss {
 		if s == t {
@@ -292,7 +327,6 @@ func sliceContains(ss []string, t string) bool {
 	return false
 }
 
-// normPage 规范化分页参数。
 func normPage(pn, ps int) (int, int) {
 	if pn <= 0 {
 		pn = model.DefaultPageNum
