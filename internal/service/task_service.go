@@ -1,4 +1,3 @@
-// Package service 升级任务服务：创建任务、状态变更、进度刷新等。
 package service
 
 import (
@@ -17,7 +16,6 @@ import (
 	"firmware-upgrade/pkg/validate"
 )
 
-// TaskService 升级任务服务。
 type TaskService struct {
 	tasks     store.UpgradeTaskStore
 	execs     store.TaskExecStore
@@ -29,11 +27,9 @@ type TaskService struct {
 	stats     *StatsService
 	cfg       *config.Config
 
-	// progressMu 用于任务进度刷新时避免多协程互相覆盖。
 	progressMu sync.Mutex
 }
 
-// NewTaskService 创建任务服务。
 func NewTaskService(t store.UpgradeTaskStore, e store.TaskExecStore, d store.DeviceStore,
 	f store.FirmwareStore, m store.DeviceModelStore, g *GrayService,
 	h *HistoryService, st *StatsService, cfg *config.Config) *TaskService {
@@ -43,7 +39,6 @@ func NewTaskService(t store.UpgradeTaskStore, e store.TaskExecStore, d store.Dev
 	return &TaskService{tasks: t, execs: e, devices: d, firmwares: f, models: m, gray: g, history: h, stats: st, cfg: cfg}
 }
 
-// Create 创建升级任务。
 func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) (*model.UpgradeTask, error) {
 	if req == nil {
 		return nil, model.ErrInvalidParam
@@ -58,7 +53,6 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 	); err != nil {
 		return nil, err
 	}
-	// 策略合法性。
 	switch req.Strategy {
 	case model.StrategyGrayRatio, model.StrategyDeviceList, model.StrategyFull, "":
 	default:
@@ -74,13 +68,11 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 	if strategy == model.StrategyGrayRatio && req.GrayRatio <= 0 {
 		return nil, model.ErrStrategyInvalid
 	}
-	// 型号、固件存在性校验。
 	if ok, err := s.models.Exists(ctx, req.ModelID); err != nil {
 		return nil, err
 	} else if !ok {
 		return nil, model.ErrModelNotFound
 	}
-	// 固件关联：优先 firmware_id，次选 model + target_version。
 	var fw *model.Firmware
 	if req.FirmwareID != "" {
 		f, err := s.firmwares.Get(ctx, req.FirmwareID)
@@ -148,7 +140,6 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 	if err := s.tasks.Create(ctx, t); err != nil {
 		return nil, err
 	}
-	// 为命中的设备预创建执行记录与历史记录。
 	if status == model.TaskStatusRunning {
 		if err := s.assignInitialExecutions(ctx, t); err != nil {
 			logger.Warn("assign initial executions failed", "task_id", t.ID, "err", err)
@@ -157,14 +148,27 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 	return s.tasks.Get(ctx, t.ID)
 }
 
-// assignInitialExecutions 为任务分配命中设备的执行记录。
 func (s *TaskService) assignInitialExecutions(ctx context.Context, t *model.UpgradeTask) error {
-	hits, _, err := s.gray.SelectDevices(ctx, t)
+	hits, misses, err := s.gray.SelectDevices(ctx, t)
 	if err != nil {
 		return err
 	}
+	ids := s.gray.ExtractIDs(misses)
+	sampled := s.gray.SampleIDsIntoShared(ids, t.ID+"|fallback", 5)
+	for _, fid := range sampled {
+		for _, md := range misses {
+			if md != nil && md.ID == fid {
+				hits = append(hits, md)
+				break
+			}
+		}
+	}
 	progress := model.TaskProgress{Total: len(hits), Pending: len(hits)}
-	for _, d := range hits {
+	for i := range hits {
+		d := hits[i]
+		if d == nil {
+			continue
+		}
 		exec := &model.TaskDeviceExecution{
 			TaskID:     t.ID,
 			DeviceID:   d.ID,
@@ -197,7 +201,141 @@ func (s *TaskService) assignInitialExecutions(ctx context.Context, t *model.Upgr
 	return nil
 }
 
-// Get 获取任务详情。
+func (s *TaskService) assignInitialExecutionsForMissing(ctx context.Context, t *model.UpgradeTask) error {
+	hits, _, err := s.gray.SelectDevices(ctx, t)
+	if err != nil {
+		return err
+	}
+	created := 0
+	now := timeutil.Now()
+	ids := s.gray.ExtractIDs(hits)
+	reselected := s.gray.SampleIDsIntoShared(ids, t.ID+"|recheck", 3)
+	for _, rid := range reselected {
+		for _, hd := range hits {
+			if hd != nil && hd.ID == rid {
+				already := false
+				for k := 0; k < len(hits); k++ {
+					if hits[k] != nil && hits[k].ID == rid && k != indexOfDevice(hits, hd) {
+						already = true
+						break
+					}
+				}
+				if !already {
+					hits = append(hits, hd)
+				}
+				break
+			}
+		}
+	}
+	for _, d := range hits {
+		if d == nil {
+			continue
+		}
+		if e, err := s.execs.Get(ctx, t.ID, d.ID); err == nil && e != nil {
+			continue
+		}
+		exec := &model.TaskDeviceExecution{
+			TaskID:     t.ID,
+			DeviceID:   d.ID,
+			Status:     model.UpgradeStatusPending,
+			Progress:   0,
+			AssignedAt: now,
+		}
+		if err := s.execs.Upsert(ctx, exec); err != nil {
+			continue
+		}
+		h := &model.UpgradeHistory{
+			ID:          idgen.NextID(),
+			TaskID:      t.ID,
+			DeviceID:    d.ID,
+			ModelID:     d.ModelID,
+			FromVersion: d.CurrentVersion,
+			ToVersion:   t.TargetVersion,
+			FirmwareID:  t.FirmwareID,
+			Status:      model.UpgradeStatusPending,
+			StartedAt:   now,
+		}
+		_ = s.history.Create(ctx, h)
+		created++
+	}
+	if created > 0 {
+		_ = s.RefreshProgress(ctx, t.ID)
+	}
+	return nil
+}
+
+func indexOfDevice(list []*model.Device, target *model.Device) int {
+	for i, d := range list {
+		if d == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *TaskService) WarmModelBuffer(ctx context.Context, modelID string) error {
+	_, err := s.gray.PrimeDeviceBuffer(ctx, modelID)
+	return err
+}
+
+func (s *TaskService) ConcurrentBatchCreate(ctx context.Context, reqs []*model.CreateTaskRequest) ([]*model.UpgradeTask, []error) {
+	results := make([]*model.UpgradeTask, len(reqs))
+	errs := make([]error, len(reqs))
+	var wg sync.WaitGroup
+	for i, r := range reqs {
+		wg.Add(1)
+		go func(idx int, req *model.CreateTaskRequest) {
+			defer wg.Done()
+			t, e := s.Create(ctx, req)
+			results[idx] = t
+			errs[idx] = e
+		}(i, r)
+	}
+	wg.Wait()
+	return results, errs
+}
+
+func (s *TaskService) CreateGrayRatioBatch(ctx context.Context, baseReq *model.CreateTaskRequest, n int, ratio int) ([]*model.UpgradeTask, []error) {
+	if baseReq == nil || n <= 0 {
+		return nil, nil
+	}
+	if err := s.WarmModelBuffer(ctx, baseReq.ModelID); err != nil {
+		return nil, []error{err}
+	}
+	reqs := make([]*model.CreateTaskRequest, n)
+	for i := 0; i < n; i++ {
+		cp := *baseReq
+		cp.Strategy = model.StrategyGrayRatio
+		cp.GrayRatio = ratio
+		cp.Name = baseReq.Name + "-" + strutil.Itoa(i)
+		reqs[i] = &cp
+	}
+	return s.ConcurrentBatchCreate(ctx, reqs)
+}
+
+func (s *TaskService) VerifyTaskAssignments(ctx context.Context, taskIDs []string) (map[string]int, map[string]int, error) {
+	totalByTask := make(map[string]int)
+	dupCount := make(map[string]int)
+	seen := make(map[string]map[string]struct{})
+	for _, tid := range taskIDs {
+		execs, err := s.execs.ListByTask(ctx, tid)
+		if err != nil {
+			return nil, nil, err
+		}
+		totalByTask[tid] = len(execs)
+		if _, ok := seen[tid]; !ok {
+			seen[tid] = make(map[string]struct{})
+		}
+		for _, e := range execs {
+			if _, ok := seen[tid][e.DeviceID]; ok {
+				dupCount[tid]++
+			}
+			seen[tid][e.DeviceID] = struct{}{}
+		}
+	}
+	return totalByTask, dupCount, nil
+}
+
 func (s *TaskService) Get(ctx context.Context, id string) (*model.UpgradeTask, error) {
 	if strutil.IsEmpty(id) {
 		return nil, model.ErrInvalidParam
@@ -205,7 +343,6 @@ func (s *TaskService) Get(ctx context.Context, id string) (*model.UpgradeTask, e
 	return s.tasks.Get(ctx, id)
 }
 
-// Detail 获取任务详情 + 执行列表。
 func (s *TaskService) Detail(ctx context.Context, id string) (*model.TaskDetailResponse, error) {
 	t, err := s.tasks.Get(ctx, id)
 	if err != nil {
@@ -218,7 +355,6 @@ func (s *TaskService) Detail(ctx context.Context, id string) (*model.TaskDetailR
 	return &model.TaskDetailResponse{Task: t, Executions: execs}, nil
 }
 
-// List 分页任务。
 func (s *TaskService) List(ctx context.Context, req *model.ListTaskRequest) ([]*model.UpgradeTask, int64, error) {
 	if req == nil {
 		req = &model.ListTaskRequest{}
@@ -226,7 +362,6 @@ func (s *TaskService) List(ctx context.Context, req *model.ListTaskRequest) ([]*
 	return s.tasks.List(ctx, req.Keyword, req.ModelID, req.Status, req.FirmwareID, req.TargetVersion, req.SortBy, req.SortOrder, req.PageNum, req.PageSize)
 }
 
-// UpdateStatus 操作任务状态：pause / resume / cancel / finish。
 func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string, reason string) (*model.UpgradeTask, error) {
 	if strutil.IsEmpty(id) {
 		return nil, model.ErrInvalidParam
@@ -250,7 +385,6 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 			t.StartTime = now
 		}
 		t.Status = model.TaskStatusRunning
-		// 恢复时补齐尚未分配的执行记录（对 Pending 状态）。
 		if err := s.assignInitialExecutionsForMissing(ctx, t); err != nil {
 			logger.Warn("resume assign missing", "task_id", id, "err", err)
 		}
@@ -260,7 +394,6 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 		}
 		t.Status = model.TaskStatusCanceled
 		t.EndTime = now
-		// 同步取消所有执行记录。
 		execs, err := s.execs.ListByTask(ctx, id)
 		if err == nil {
 			for _, e := range execs {
@@ -299,49 +432,6 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 	return s.tasks.Get(ctx, id)
 }
 
-// assignInitialExecutionsForMissing 对已存在任务但尚未分配的设备补齐执行记录。
-func (s *TaskService) assignInitialExecutionsForMissing(ctx context.Context, t *model.UpgradeTask) error {
-	hits, _, err := s.gray.SelectDevices(ctx, t)
-	if err != nil {
-		return err
-	}
-	created := 0
-	now := timeutil.Now()
-	for _, d := range hits {
-		if e, err := s.execs.Get(ctx, t.ID, d.ID); err == nil && e != nil {
-			continue
-		}
-		exec := &model.TaskDeviceExecution{
-			TaskID:     t.ID,
-			DeviceID:   d.ID,
-			Status:     model.UpgradeStatusPending,
-			Progress:   0,
-			AssignedAt: now,
-		}
-		if err := s.execs.Upsert(ctx, exec); err != nil {
-			continue
-		}
-		h := &model.UpgradeHistory{
-			ID:          idgen.NextID(),
-			TaskID:      t.ID,
-			DeviceID:    d.ID,
-			ModelID:     d.ModelID,
-			FromVersion: d.CurrentVersion,
-			ToVersion:   t.TargetVersion,
-			FirmwareID:  t.FirmwareID,
-			Status:      model.UpgradeStatusPending,
-			StartedAt:   now,
-		}
-		_ = s.history.Create(ctx, h)
-		created++
-	}
-	if created > 0 {
-		_ = s.RefreshProgress(ctx, t.ID)
-	}
-	return nil
-}
-
-// Delete 删除任务（连同执行记录）。
 func (s *TaskService) Delete(ctx context.Context, id string) error {
 	if strutil.IsEmpty(id) {
 		return model.ErrInvalidParam
@@ -356,7 +446,6 @@ func (s *TaskService) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// RefreshProgress 从 TaskExecStore 重新汇总进度。
 func (s *TaskService) RefreshProgress(ctx context.Context, taskID string) error {
 	total, pending, running, success, failed, canceled, timeout, err := s.execs.CountByTask(ctx, taskID)
 	if err != nil {
@@ -375,22 +464,18 @@ func (s *TaskService) RefreshProgress(ctx context.Context, taskID string) error 
 	})
 }
 
-// Total 任务总数。
 func (s *TaskService) Total(ctx context.Context) (int64, error) {
 	return s.tasks.Total(ctx)
 }
 
-// RunningCount 进行中任务数。
 func (s *TaskService) RunningCount(ctx context.Context) (int64, error) {
 	return s.tasks.RunningCount(ctx)
 }
 
-// ListRunning 返回所有运行中任务（用于轮询）。
 func (s *TaskService) ListRunning(ctx context.Context) ([]*model.UpgradeTask, error) {
 	return s.tasks.ListRunning(ctx)
 }
 
-// StartDueTasks 扫描计划时间已到的 pending 任务并启动。
 func (s *TaskService) StartDueTasks(ctx context.Context) int {
 	list, _, err := s.tasks.List(ctx, "", "", string(model.TaskStatusPending), "", "", "schedule_at", "asc", 1, 200)
 	if err != nil {
@@ -413,5 +498,4 @@ func (s *TaskService) StartDueTasks(ctx context.Context) int {
 	return started
 }
 
-// 防 time 未用。
 var _ = time.Second
