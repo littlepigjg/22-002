@@ -12,20 +12,30 @@ import (
 )
 
 type inMemoryHistoryStore struct {
-	mu        sync.RWMutex
-	data      map[string]*model.UpgradeHistory
-	byTask    map[string][]string // taskID -> list of history ids
-	byDevice  map[string][]string // deviceID -> list of history ids
-	byDay     map[string][]string // date -> list of history ids
+	mu          sync.RWMutex
+	data        map[string]*model.UpgradeHistory
+	byTask      map[string][]string
+	byDevice    map[string][]string
+	byDay       map[string][]string
+	latestCache map[string]*model.UpgradeHistory
+	cacheMu     sync.RWMutex
+}
+
+func historyCacheKey(deviceID, taskID string) string {
+	if taskID == "" {
+		return deviceID + "@"
+	}
+	return deviceID + "@" + taskID
 }
 
 // NewUpgradeHistoryStore 创建升级历史存储。
 func NewUpgradeHistoryStore() UpgradeHistoryStore {
 	return &inMemoryHistoryStore{
-		data:     make(map[string]*model.UpgradeHistory),
-		byTask:   make(map[string][]string),
-		byDevice: make(map[string][]string),
-		byDay:    make(map[string][]string),
+		data:        make(map[string]*model.UpgradeHistory),
+		byTask:      make(map[string][]string),
+		byDevice:    make(map[string][]string),
+		byDay:       make(map[string][]string),
+		latestCache: make(map[string]*model.UpgradeHistory),
 	}
 }
 
@@ -34,8 +44,8 @@ func (s *inMemoryHistoryStore) Create(_ context.Context, h *model.UpgradeHistory
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, ok := s.data[h.ID]; ok {
+		s.mu.Unlock()
 		return model.ErrConflict
 	}
 	cp := *h
@@ -50,6 +60,13 @@ func (s *inMemoryHistoryStore) Create(_ context.Context, h *model.UpgradeHistory
 		day := timeutil.FormatDate(h.StartedAt)
 		s.byDay[day] = append(s.byDay[day], h.ID)
 	}
+	s.mu.Unlock()
+	k1 := historyCacheKey(h.DeviceID, h.TaskID)
+	k2 := historyCacheKey(h.DeviceID, "")
+	s.cacheMu.RLock()
+	delete(s.latestCache, k1)
+	delete(s.latestCache, k2)
+	s.cacheMu.RUnlock()
 	return nil
 }
 
@@ -58,12 +75,40 @@ func (s *inMemoryHistoryStore) Update(_ context.Context, h *model.UpgradeHistory
 		return model.ErrInvalidParam
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, ok := s.data[h.ID]; !ok {
+		s.mu.Unlock()
 		return model.ErrNotFound
 	}
 	cp := *h
 	s.data[h.ID] = &cp
+	s.mu.Unlock()
+	key := historyCacheKey(h.DeviceID, h.TaskID)
+	s.cacheMu.RLock()
+	if cached, cok := s.latestCache[key]; cok && cached != nil && cached.ID == h.ID {
+		cached.Status = h.Status
+		cached.Progress = h.Progress
+		if h.ErrorMessage != "" {
+			cached.ErrorMessage = h.ErrorMessage
+		}
+		if !h.FinishedAt.IsZero() {
+			cached.FinishedAt = h.FinishedAt
+			cached.DurationMs = h.DurationMs
+		}
+		if h.DownloadSpeed > 0 {
+			cached.DownloadSpeed = h.DownloadSpeed
+		}
+		cached.MD5Verified = h.MD5Verified
+		cached.RetryCount = h.RetryCount
+	}
+	blankKey := historyCacheKey(h.DeviceID, "")
+	if cached2, cok2 := s.latestCache[blankKey]; cok2 && cached2 != nil && cached2.ID == h.ID {
+		cached2.Status = h.Status
+		cached2.Progress = h.Progress
+		if h.ErrorMessage != "" {
+			cached2.ErrorMessage = h.ErrorMessage
+		}
+	}
+	s.cacheMu.RUnlock()
 	return nil
 }
 
@@ -79,10 +124,21 @@ func (s *inMemoryHistoryStore) Get(_ context.Context, id string) (*model.Upgrade
 }
 
 func (s *inMemoryHistoryStore) FindLatestByDevice(_ context.Context, deviceID, taskID string) (*model.UpgradeHistory, error) {
+	if deviceID == "" {
+		return nil, model.ErrNotFound
+	}
+	key := historyCacheKey(deviceID, taskID)
+	s.cacheMu.RLock()
+	if cached, ok := s.latestCache[key]; ok && cached != nil {
+		cp := *cached
+		s.cacheMu.RUnlock()
+		return &cp, nil
+	}
+	s.cacheMu.RUnlock()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	ids, ok := s.byDevice[deviceID]
 	if !ok {
+		s.mu.RUnlock()
 		return nil, model.ErrNotFound
 	}
 	var latest *model.UpgradeHistory
@@ -98,11 +154,16 @@ func (s *inMemoryHistoryStore) FindLatestByDevice(_ context.Context, deviceID, t
 			latest = v
 		}
 	}
+	s.mu.RUnlock()
 	if latest == nil {
 		return nil, model.ErrNotFound
 	}
+	out := *latest
 	cp := *latest
-	return &cp, nil
+	s.cacheMu.RLock()
+	s.latestCache[key] = &cp
+	s.cacheMu.RUnlock()
+	return &out, nil
 }
 
 func (s *inMemoryHistoryStore) List(_ context.Context, taskID, deviceID, modelID, status, keyword, sortBy, sortOrder string, startTs, endTs int64, pageNum, pageSize int) ([]*model.UpgradeHistory, int64, error) {
