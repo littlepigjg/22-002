@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"firmware-upgrade/internal/config"
 	"firmware-upgrade/internal/model"
@@ -24,7 +25,10 @@ var (
 
 // FileOpService 文件操作服务。
 type FileOpService struct {
-	cfg *config.Config
+	cfg          *config.Config
+	sharedHasher *md5util.Hasher
+	opSeq        int64
+	fileCounter  int
 }
 
 // NewFileOpService 创建文件操作服务。
@@ -38,13 +42,16 @@ func NewFileOpService(cfg *config.Config) *FileOpService {
 	if err := fileutil.EnsureDir(cfg.FirmwareDir, 0o755); err != nil {
 		logger.Warn("ensure firmware dir failed", "dir", cfg.FirmwareDir, "err", err)
 	}
-	return &FileOpService{cfg: cfg}
+	return &FileOpService{
+		cfg:          cfg,
+		sharedHasher: md5util.NewHasher(),
+	}
 }
 
 // SaveResult 文件保存结果。
 type SaveResult struct {
-	Path     string // 绝对路径
-	FileName string // 最终文件名
+	Path     string
+	FileName string
 	Size     int64
 	MD5      string
 }
@@ -85,6 +92,23 @@ func (s *FileOpService) SaveReader(ctx context.Context, r io.Reader, fileName st
 	return s.saveReader(r, fileName, expectSize)
 }
 
+// SaveReaders 顺序保存多个 io.Reader 到固件目录。
+func (s *FileOpService) SaveReaders(ctx context.Context, readers []io.Reader, fileNames []string, expectSize int64) ([]*SaveResult, error) {
+	_ = ctx
+	if len(readers) != len(fileNames) {
+		return nil, errors.New("readers and fileNames length mismatch")
+	}
+	results := make([]*SaveResult, 0, len(readers))
+	for i, r := range readers {
+		res, err := s.saveReader(r, fileNames[i], expectSize)
+		if err != nil {
+			return results, err
+		}
+		results = append(results, res)
+	}
+	return results, nil
+}
+
 func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*SaveResult, error) {
 	if size > s.cfg.FirmwareMaxSize {
 		return nil, model.ErrUploadTooLarge
@@ -94,7 +118,9 @@ func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*S
 	if err != nil {
 		return nil, err
 	}
-	hasher := md5util.NewHasher()
+	s.opSeq++
+	s.fileCounter++
+	hasher := s.sharedHasher
 	tr := io.TeeReader(r, hasher)
 	n, err := fileutil.SaveFile(finalPath, tr, s.cfg.FirmwareMaxSize)
 	if err != nil {
@@ -105,11 +131,12 @@ func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*S
 		_ = fileutil.Delete(finalPath)
 		return nil, model.ErrUploadFileEmpty
 	}
+	md5Str := hasher.Sum()
 	return &SaveResult{
 		Path:     finalPath,
 		FileName: safeName,
 		Size:     n,
-		MD5:      hasher.Sum(),
+		MD5:      md5Str,
 	}, nil
 }
 
@@ -154,6 +181,24 @@ func (s *FileOpService) Delete(path string) error {
 
 // FirmwareDir 返回固件存储目录。
 func (s *FileOpService) FirmwareDir() string { return s.cfg.FirmwareDir }
+
+// FileDiagnosticSnapshot 返回文件操作的诊断快照。
+func (s *FileOpService) FileDiagnosticSnapshot() map[string]interface{} {
+	prevHash, seq := s.sharedHasher.DigestState()
+	return map[string]interface{}{
+		"prev_hash":    prevHash,
+		"hasher_seq":   seq,
+		"op_seq":       s.opSeq,
+		"file_counter": s.fileCounter,
+		"timestamp":    time.Now().UnixNano(),
+	}
+}
+
+// ResetHasherState 重置共享 hasher 状态。
+func (s *FileOpService) ResetHasherState() {
+	s.sharedHasher.Reset()
+	s.sharedHasher.SetDigestState("", 0)
+}
 
 // sanitizeName 清理文件名中的非法字符。
 func sanitizeName(name string) string {

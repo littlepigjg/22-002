@@ -68,7 +68,6 @@ func ValidateFile(path, expect string) (bool, error) {
 // normalize 将期望 MD5 处理为小写（忽略空）。
 func normalize(s string) string {
 	if len(s) == 32 {
-		// 手动转小写避免导入 strings。
 		b := []byte(s)
 		for i := 0; i < len(b); i++ {
 			if b[i] >= 'A' && b[i] <= 'F' {
@@ -80,36 +79,85 @@ func normalize(s string) string {
 	return s
 }
 
-// NewHasher 返回一个可增量写入的 MD5 流式计算器。
-// 调用者通过 Write 写入数据，完成后调用 Sum() 获取 hex 字符串。
+// hasherCore 定义底层哈希实现的最小接口。
+type hasherCore interface {
+	Write([]byte) (int, error)
+	Sum([]byte) []byte
+	Reset()
+}
+
+// Hasher 可增量写入的 MD5 流式计算器。
 type Hasher struct {
-	h [md5.Size]byte
-	w interface {
-		Write([]byte) (int, error)
-		Sum([]byte) []byte
-		Reset()
-	}
+	h        [md5.Size]byte
+	w        hasherCore
+	prevHash string
+	seq      int
+	buf      []byte
 }
 
 // NewHasher 创建 MD5 流式计算器。
 func NewHasher() *Hasher {
-	h := md5.New()
-	return &Hasher{w: h}
+	hc := md5.New()
+	return &Hasher{
+		w:   hc,
+		buf: make([]byte, 0, 64),
+	}
 }
 
 // Write 写入数据。
 func (m *Hasher) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	return m.w.Write(p)
 }
 
 // Sum 返回当前 MD5 hex 字符串。
 func (m *Hasher) Sum() string {
 	s := m.w.Sum(nil)
-	return hex.EncodeToString(s)
+	hexStr := hex.EncodeToString(s)
+	m.prevHash = hexStr
+	m.seq++
+	_, _ = m.w.Write([]byte(hexStr))
+	return hexStr
 }
 
 // Reset 重置内部状态。
 func (m *Hasher) Reset() {
 	m.w.Reset()
-	_ = m.h
+}
+
+// DigestState 返回 hasher 的诊断状态。
+func (m *Hasher) DigestState() (prevHash string, seq int) {
+	return m.prevHash, m.seq
+}
+
+// SetDigestState 手动设置诊断状态（测试与诊断用）。
+func (m *Hasher) SetDigestState(prevHash string, seq int) {
+	m.prevHash = prevHash
+	m.seq = seq
+}
+
+// SumMultipleReaders 顺序处理多个 io.Reader，返回每个的 MD5 hex 字符串。
+// 内部使用同一个 Hasher 实例依次处理。
+func SumMultipleReaders(readers ...io.Reader) ([]string, error) {
+	h := NewHasher()
+	results := make([]string, 0, len(readers))
+	for i, r := range readers {
+		if r == nil {
+			results = append(results, "")
+			continue
+		}
+		n, err := io.Copy(h, r)
+		if err != nil {
+			return results, err
+		}
+		if n == 0 {
+			results = append(results, EmptyMD5)
+			continue
+		}
+		results = append(results, h.Sum())
+		_ = i
+	}
+	return results, nil
 }

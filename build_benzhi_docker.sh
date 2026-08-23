@@ -3,12 +3,14 @@
 # build_benzhi_docker.sh —— 为本项目构建评测专用镜像。
 #
 # 用法：
-#   ./build_benzhi_docker.sh
+#   ./build_benzhi_docker.sh [name] [tag] [platform]
+#   ./build_benzhi_docker.sh exam-system latest linux/amd64
 #   ./build_benzhi_docker.sh --tag my-repo/fu-benzhi:latest
 #   ./build_benzhi_docker.sh --no-cache --proxy cn --load
 #
 # 参数：
-#   --tag, -t        目标镜像标签，默认：firmware-upgrade-benzhi:$(date +%Y%m%d-%H%M)
+#   位置参数: name tag platform (platform 可选，如 linux/amd64 或 linux/arm64)
+#   --tag, -t        目标镜像标签
 #   --file, -f       Dockerfile 路径，默认：./benzhi.Dockerfile
 #   --proxy, -p      使用国内加速：cn 或默认 direct
 #   --no-cache       强制不使用构建缓存
@@ -26,7 +28,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 # ---- 默认参数 -----------------------------------------------------------------
-TAG="firmware-upgrade-benzhi:$(date +%Y%m%d-%H%M%S)"
+NAME=""
+TAG=""
+PLATFORM=""
 DOCKERFILE="./benzhi.Dockerfile"
 PROXY="direct"
 NO_CACHE=0
@@ -46,14 +50,35 @@ while [[ $# -gt 0 ]]; do
     --save)          SAVE=1;     shift ;;
     -h|--help)
       sed -n '2,30p' "$0"; exit 0 ;;
+    linux/*)         PLATFORM="$1"; shift ;;
     *)
-      echo "未知参数: $1" >&2; exit 2 ;;
+      if [[ -z "${NAME}" ]]; then
+        NAME="$1"; shift
+      elif [[ -z "${TAG}" ]]; then
+        TAG="$1"; shift
+      else
+        echo "未知参数: $1" >&2; exit 2
+      fi
+      ;;
   esac
 done
 
-echo "[build_benzhi] TAG         = ${TAG}"
+# ---- 推导 TAG 与 LOAD ----------------------------------------------------------
+if [[ -n "${NAME}" && -n "${TAG}" ]]; then
+  FULL_TAG="${NAME}:${TAG}"
+else
+  FULL_TAG="${TAG:-firmware-upgrade-benzhi:$(date +%Y%m%d-%H%M%S)}"
+fi
+
+# 如果指定了单平台构建，自动加 --load
+if [[ -n "${PLATFORM}" ]]; then
+  LOAD=1
+fi
+
+echo "[build_benzhi] TAG         = ${FULL_TAG}"
 echo "[build_benzhi] DOCKERFILE  = ${DOCKERFILE}"
 echo "[build_benzhi] PROXY       = ${PROXY}"
+echo "[build_benzhi] PLATFORM    = ${PLATFORM:-auto (host default)}"
 echo "[build_benzhi] NO_CACHE    = ${NO_CACHE}"
 echo "[build_benzhi] LOAD/PUSH/SAVE = ${LOAD}/${PUSH}/${SAVE}"
 
@@ -86,6 +111,12 @@ else
 fi
 
 BUILDX_ARGS=()
+if [[ -n "${PLATFORM}" ]]; then
+  BUILDX_ARGS+=( --platform "${PLATFORM}" )
+  # 推导 GOARCH
+  GOARCH_VAL=$(echo "${PLATFORM}" | sed 's|linux/||')
+  BUILD_PROXY_ARGS+=( --build-arg "GOARCH=${GOARCH_VAL}" )
+fi
 if [[ "${NO_CACHE}" -eq 1 ]]; then
   BUILDX_ARGS+=( --no-cache )
 fi
@@ -99,20 +130,21 @@ fi
 # ---- 构建 --------------------------------------------------------------------
 echo "[build_benzhi] 开始构建镜像..."
 
-docker buildx build "${BUILDX_ARGS[@]}" "${BUILD_PROXY_ARGS[@]}" \
-  -t "${TAG}" \
+# 使用 default builder（docker driver），避免容器 builder 网络问题
+docker buildx build --builder default "${BUILDX_ARGS[@]}" "${BUILD_PROXY_ARGS[@]}" \
+  -t "${FULL_TAG}" \
   -f "${DOCKERFILE}" \
   .
 
-echo "[build_benzhi] 构建完成：${TAG}"
+echo "[build_benzhi] 构建完成：${FULL_TAG}"
 
 # ---- 校验镜像 ----------------------------------------------------------------
 if command -v docker >/dev/null && [[ "${LOAD}" -eq 1 || "${PUSH}" -ne 1 ]]; then
   set +e
-  INSPECT_ID=$(docker inspect -f '{{.Id}}' "${TAG}" 2>/dev/null || true)
+  INSPECT_ID=$(docker inspect -f '{{.Id}}' "${FULL_TAG}" 2>/dev/null || true)
   set -e
   if [[ -n "${INSPECT_ID}" ]]; then
-    SIZE=$(docker inspect -f '{{.Size}}' "${TAG}" 2>/dev/null | awk '{printf "%.1f MiB", $1/1024/1024}')
+    SIZE=$(docker inspect -f '{{.Size}}' "${FULL_TAG}" 2>/dev/null | awk '{printf "%.1f MiB", $1/1024/1024}')
     echo "[build_benzhi] 镜像 ID    = ${INSPECT_ID}"
     echo "[build_benzhi] 镜像大小  = ${SIZE}"
   fi
@@ -122,7 +154,7 @@ fi
 if [[ "${SAVE}" -eq 1 ]]; then
   TAR="${SCRIPT_DIR}/firmware-upgrade-benzhi.tar.gz"
   echo "[build_benzhi] 导出镜像到：${TAR}"
-  docker save "${TAG}" | gzip > "${TAR}"
+  docker save "${FULL_TAG}" | gzip > "${TAR}"
   SIZE=$(du -h "${TAR}" | cut -f1)
   echo "[build_benzhi] 导出大小：${SIZE}"
 fi
@@ -133,7 +165,7 @@ cat <<EOF
 === 启动速查（本地运行）===
 
   # 一次性前台启动
-  docker run --rm -p 8080:8080 -e SEED_DATA=1 ${TAG}
+  docker run --rm -p 8080:8080 -e SEED_DATA=1 ${FULL_TAG}
 
   # 后台运行 + 挂载数据目录
   mkdir -p ./data && \
@@ -143,7 +175,7 @@ cat <<EOF
     -e SEED_DATA=1 \
     -e LOG_LEVEL=debug \
     --health-cmd="curl -fsS http://127.0.0.1:8080/health/live || exit 1" \
-    ${TAG}
+    ${FULL_TAG}
 
   # 健康检查
   curl http://127.0.0.1:8080/health/live
