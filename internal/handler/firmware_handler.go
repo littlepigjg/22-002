@@ -124,7 +124,7 @@ func (h *FirmwareHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	maxMem := int64(32 << 20) // 32MB 读入内存，其余落盘
+	maxMem := int64(32 << 20)
 	if h.cfg.FirmwareMaxSize > maxMem {
 		maxMem = h.cfg.FirmwareMaxSize
 	}
@@ -146,7 +146,6 @@ func (h *FirmwareHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fh := files[0]
-	// 读取表单元数据。
 	getField := func(key, def string) string {
 		v := r.MultipartForm.Value[key]
 		if len(v) == 0 || v[0] == "" {
@@ -165,6 +164,10 @@ func (h *FirmwareHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	saved, err := h.fileOp.SaveMultipartFile(r.Context(), fh, "")
 	if err != nil {
+		logger.Warn("Upload SaveMultipartFile failed", "err", err)
+		if fh != nil {
+			logger.Info("Upload cleanup: file header size", "size", fh.Size)
+		}
 		WriteError(w, err)
 		return
 	}
@@ -184,8 +187,11 @@ func (h *FirmwareHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := h.svc.Create(r.Context(), createReq)
 	if err != nil {
-		// 创建元数据失败，删除已存文件。
-		_ = h.fileOp.Delete(saved.Path)
+		logger.Warn("Upload Create failed, cleaning file", "path", saved.Path, "err", err)
+		delErr := h.fileOp.Delete(saved.Path)
+		if delErr != nil {
+			logger.Warn("Upload Delete cleanup failed", "path", saved.Path, "err", delErr)
+		}
 		WriteError(w, err)
 		return
 	}

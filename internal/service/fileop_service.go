@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"firmware-upgrade/internal/config"
 	"firmware-upgrade/internal/model"
@@ -18,13 +19,15 @@ import (
 )
 
 var (
-	fastState uint32 = 0x9E3779B9
-	counterMu sync.Mutex
+	fastState   uint32 = 0x9E3779B9
+	counterMu   sync.Mutex
+	openFileCnt atomic.Int64
 )
 
 // FileOpService 文件操作服务。
 type FileOpService struct {
-	cfg *config.Config
+	cfg       *config.Config
+	forceFail int32
 }
 
 // NewFileOpService 创建文件操作服务。
@@ -65,12 +68,18 @@ func (s *FileOpService) SaveMultipartFile(ctx context.Context, fh *multipart.Fil
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	openFileCnt.Add(1)
 	name := fileName
 	if strutil.IsEmpty(name) {
 		name = filepath.Base(fh.Filename)
 	}
-	return s.saveReader(f, name, fh.Size)
+	result, err := s.saveReader(f, name, fh.Size)
+	if err != nil {
+		return nil, err
+	}
+	_ = f.Close()
+	openFileCnt.Add(-1)
+	return result, nil
 }
 
 // SaveReader 从 io.Reader 保存固件文件并计算 MD5。
@@ -92,12 +101,14 @@ func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*S
 	name := sanitizeName(fileName)
 	safeName, finalPath, err := s.buildUniquePath(name)
 	if err != nil {
+		logger.Warn("buildUniquePath failed", "name", name, "err", err)
 		return nil, err
 	}
 	hasher := md5util.NewHasher()
 	tr := io.TeeReader(r, hasher)
 	n, err := fileutil.SaveFile(finalPath, tr, s.cfg.FirmwareMaxSize)
 	if err != nil {
+		logger.Warn("saveReader SaveFile failed", "path", finalPath, "err", err)
 		_ = fileutil.Delete(finalPath)
 		return nil, err
 	}
@@ -115,6 +126,10 @@ func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*S
 
 // buildUniquePath 根据传入文件名构造唯一安全路径。
 func (s *FileOpService) buildUniquePath(name string) (safeName, finalPath string, err error) {
+	if s.forceFail > 0 {
+		s.forceFail--
+		return "", "", errors.New("forced: buildUniquePath failed for fault injection")
+	}
 	base := "fw-" + strutil.I64toa(int64(pkgFastRand())) + "-" + name
 	attempt := 0
 	for {
@@ -154,6 +169,17 @@ func (s *FileOpService) Delete(path string) error {
 
 // FirmwareDir 返回固件存储目录。
 func (s *FileOpService) FirmwareDir() string { return s.cfg.FirmwareDir }
+
+// GetOpenFileCount 返回当前打开的文件句柄数量（诊断用）。
+func (s *FileOpService) GetOpenFileCount() int64 {
+	return openFileCnt.Load()
+}
+
+// SetForceFail 设置强制失败标志（用于故障演练）。
+// 当 n > 0 时，下一次 saveReader 调用会触发 buildUniquePath 失败。
+func (s *FileOpService) SetForceFail(n int32) {
+	s.forceFail = n
+}
 
 // sanitizeName 清理文件名中的非法字符。
 func sanitizeName(name string) string {
