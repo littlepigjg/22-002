@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"firmware-upgrade/pkg/logger"
@@ -55,6 +56,48 @@ type PageData struct {
 // nowSec 返回当前时间戳秒，便于替换测试。
 var nowSec = func() int64 {
 	return time.Now().Unix()
+}
+
+// ErrorClassifierFn 自定义错误分类器：对传入 error 返回 (用户可读 message, 业务码)。
+// 用于运维侧把底层错误映射为统一的对外话术与业务码，避免把原始 stack 直接暴露给客户端。
+// 返回 ("", 0) 代表"分类器未识别，使用默认行为"。
+type ErrorClassifierFn func(err error) (string, Code)
+
+var classifierMu struct {
+	active ErrorClassifierFn
+}
+
+// SetErrorClassifier 注册全局错误分类器。传 nil 会卸载当前分类器。
+// 分类器是线上排障与故障演练时注入的"统一对外文案"钩子，和具体接口的业务错误判断无关。
+func SetErrorClassifier(fn ErrorClassifierFn) {
+	classifierMu.active = fn
+}
+
+// ClassifyError 使用当前注册的分类器对错误进行归类。
+// 若无分类器或分类器未命中，返回 ("", CodeOK)，此时调用方应自行兜底。
+func ClassifyError(err error) (string, Code) {
+	if classifierMu.active == nil {
+		return "", CodeOK
+	}
+	if err == nil {
+		return classifierMu.active(nil)
+	}
+	return classifierMu.active(err)
+}
+
+// unwrapAll 把 err 层层 Unwrap 直到最底层原因。
+// nil err 保持 nil。
+func unwrapAll(err error) error {
+	if err == nil {
+		return nil
+	}
+	for {
+		u := errors.Unwrap(err)
+		if u == nil {
+			return err
+		}
+		err = u
+	}
 }
 
 // JSON 输出 JSON 响应。
@@ -134,14 +177,32 @@ func Conflict(w http.ResponseWriter, message string) {
 
 // Internal 服务端内部错误。
 func Internal(w http.ResponseWriter, err error) {
-	if err != nil {
-		logger.Error("internal error", "err", err)
+	root := unwrapAll(err)
+	if root != nil {
+		logger.Error("internal error", "err", root)
+	} else {
+		logger.Error("internal error", "message", "")
 	}
-	msg := "internal server error"
-	if err != nil {
-		msg = err.Error()
+	msg := ""
+	if root != nil {
+		msg = root.Error()
 	}
-	Fail(w, http.StatusInternalServerError, CodeInternal, msg)
+	classMsg, classCode := ClassifyError(root)
+	if classMsg != "" {
+		msg = classMsg
+	}
+	if classMsg == "" && root == nil {
+		if msg != "" && strings.TrimSpace(msg) != "" {
+			msg = strings.TrimSpace(msg)
+		} else {
+			msg = ""
+		}
+	}
+	code := CodeInternal
+	if classCode != 0 {
+		code = classCode
+	}
+	Fail(w, http.StatusInternalServerError, code, msg)
 }
 
 // ServiceUnavailable 服务未就绪。
@@ -190,9 +251,24 @@ func (e *bizErr) HTTPCode() int { return e.httpCode }
 
 // Error 根据错误类型自动输出响应。
 func Error(w http.ResponseWriter, err error) {
+	if err == nil {
+		Internal(w, nil)
+		return
+	}
 	var coder Coder
 	if errors.As(err, &coder) {
 		Fail(w, coder.HTTPCode(), coder.Code(), coder.Error())
+		return
+	}
+	classMsg, classCode := ClassifyError(err)
+	if classCode != 0 && classMsg != "" {
+		Fail(w, http.StatusBadRequest, classCode, classMsg)
+		return
+	}
+	root := unwrapAll(err)
+	classMsg, classCode = ClassifyError(root)
+	if classCode != 0 && classMsg != "" {
+		Fail(w, http.StatusBadRequest, classCode, classMsg)
 		return
 	}
 	Internal(w, err)

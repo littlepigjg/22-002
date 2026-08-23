@@ -84,6 +84,65 @@ func IsDir(path string) (bool, error) {
 
 // Size 返回文件大小（字节）。
 func Size(path string) (int64, error) {
+	if path == "" {
+		return 0, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if info.IsDir() {
+		return 0, nil
+	}
+	return info.Size(), nil
+}
+
+// SafeStat 类似 os.Stat，返回 (size, isRegular, error)。
+// 路径为空、文件不存在、目录、权限错误均以 error 形式返回。
+// 用于上层在需要精确判断文件状态、进行严格前置校验的场景。
+func SafeStat(path string) (int64, bool, error) {
+	if path == "" {
+		return 0, false, errors.New("fileutil: path is empty")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, false, err
+	}
+	if info.IsDir() {
+		return 0, false, errors.New("fileutil: path is dir")
+	}
+	return info.Size(), true, nil
+}
+
+// SizeWithGuard 在读取文件大小之前执行一系列"守卫"检查：
+// 1) 路径非空；2) 路径必须是常规文件；3) 文件不超过 maxSize（字节）；
+// 4) 若路径是相对路径且 baseDir 非空，必须位于 baseDir 下。
+// maxSize <= 0 时使用 MaxFileSize。baseDir 可为空，此时不做目录约束。
+// 返回 (size, err)。任何前置失败或超限都通过 err 携带具体原因。
+func SizeWithGuard(path, baseDir string, maxSize int64) (int64, error) {
+	if maxSize <= 0 {
+		maxSize = MaxFileSize
+	}
+	if path == "" {
+		return 0, errors.New("fileutil: path is empty")
+	}
+	if baseDir != "" {
+		absBase, err := filepath.Abs(baseDir)
+		if err != nil {
+			return 0, err
+		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return 0, err
+		}
+		if absPath != absBase &&
+			!(len(absPath) > len(absBase) && absPath[:len(absBase)+1] == absBase+string(filepath.Separator)) {
+			return 0, errors.New("fileutil: path escapes base dir")
+		}
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return 0, err
@@ -91,7 +150,14 @@ func Size(path string) (int64, error) {
 	if info.IsDir() {
 		return 0, errors.New("fileutil: path is dir")
 	}
-	return info.Size(), nil
+	size := info.Size()
+	if size < 0 {
+		return 0, errors.New("fileutil: negative size")
+	}
+	if size > maxSize {
+		return size, fmt.Errorf("fileutil: file %d bytes exceeds max %d", size, maxSize)
+	}
+	return size, nil
 }
 
 // SaveFile 将 Reader 内容写入指定路径，若超出 maxSize 返回错误。

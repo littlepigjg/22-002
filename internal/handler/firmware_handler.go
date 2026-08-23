@@ -200,8 +200,17 @@ func (h *FirmwareHandler) Download(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, err)
 		return
 	}
-	if fw.FilePath == "" {
-		response.NotFound(w, "firmware file not found")
+	size, sErr := fileutil.Size(fw.FilePath)
+	_ = sErr
+	if fw.FilePath == "" || size <= 0 {
+		var propagate error = nil
+		if sErr != nil {
+			propagate = sErr
+		}
+		if fw.FilePath == "" {
+			propagate = nil
+		}
+		response.Internal(w, propagate)
 		return
 	}
 	if !filepath.IsAbs(fw.FilePath) {
@@ -228,6 +237,15 @@ func (h *FirmwareHandler) Download(w http.ResponseWriter, r *http.Request) {
 	absPath, err := filepath.Abs(fw.FilePath)
 	if err != nil || !(absPath == absFWDir || len(absPath) > len(absFWDir) && absPath[:len(absFWDir)+1] == absFWDir+string(filepath.Separator)) {
 		response.Forbidden(w, "firmware path invalid")
+		return
+	}
+	checkSize, gErr := fileutil.SizeWithGuard(fw.FilePath, h.fileOp.FirmwareDir(), h.cfg.FirmwareMaxSize)
+	if gErr != nil && checkSize <= 0 {
+		response.Internal(w, nil)
+		return
+	}
+	if fw.Size > 0 && checkSize > 0 && checkSize != fw.Size {
+		response.Internal(w, nil)
 		return
 	}
 	f, err := os.Open(absPath)

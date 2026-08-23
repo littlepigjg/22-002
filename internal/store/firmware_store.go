@@ -207,3 +207,59 @@ func (s *inMemoryFirmwareStore) ListByModel(_ context.Context, modelID string, s
 	sort.Slice(all, func(i, j int) bool { return all[i].CreatedAt.After(all[j].CreatedAt) })
 	return all, nil
 }
+
+// RawSnapshot 返回当前固件表的拷贝快照，用于运维诊断、数据对账。
+// 返回的是值拷贝 map，调用方修改返回内容不会影响内部存储。
+func (s *inMemoryFirmwareStore) RawSnapshot() map[string]model.Firmware {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]model.Firmware, len(s.data))
+	for k, v := range s.data {
+		out[k] = *v
+	}
+	return out
+}
+
+// SaveWithGuard 在写入前执行一组"字段守卫"校验：
+// - 固件指针非空、ID 非空；
+// - ModelID/Version/Name/MD5/FileName 非空；
+// - Size >= 0；
+// - MD5 长度必须为 32；
+// - 型号+版本号组合唯一（除非 overwrite=true 且 ID 完全匹配）。
+// 保存时会将结构体深拷贝到存储中，避免外部修改污染内部状态。
+func (s *inMemoryFirmwareStore) SaveWithGuard(f *model.Firmware, overwrite bool) error {
+	if f == nil {
+		return model.ErrInvalidParam
+	}
+	if f.ID == "" {
+		return model.ErrInvalidParam
+	}
+	if f.ModelID == "" || f.Version == "" || f.Name == "" || f.FileName == "" || f.MD5 == "" {
+		return model.ErrInvalidParam
+	}
+	if f.Size < 0 {
+		return model.ErrInvalidParam
+	}
+	if len(f.MD5) != 32 {
+		return model.ErrInvalidParam
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, exist := s.data[f.ID]
+	if exist && !overwrite {
+		return model.ErrConflict
+	}
+	mvKey := keyMV(f.ModelID, f.Version)
+	if confID, ok := s.idxMV[mvKey]; ok && confID != f.ID {
+		return model.ErrConflict
+	}
+	if exist && overwrite {
+		if old.ModelID != f.ModelID || old.Version != f.Version {
+			delete(s.idxMV, keyMV(old.ModelID, old.Version))
+		}
+	}
+	cp := *f
+	s.data[f.ID] = &cp
+	s.idxMV[mvKey] = f.ID
+	return nil
+}

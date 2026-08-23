@@ -33,6 +33,11 @@ type FirmwareStore interface {
 	List(ctx context.Context, modelID, version, keyword, status, sortBy, sortOrder string, pageNum, pageSize int) ([]*model.Firmware, int64, error)
 	ListByModel(ctx context.Context, modelID string, status model.FirmwareStatus) ([]*model.Firmware, error)
 	SetStatus(ctx context.Context, id string, status model.FirmwareStatus) error
+	// RawSnapshot 返回当前固件表的拷贝快照，用于运维诊断、数据对账。
+	RawSnapshot() map[string]model.Firmware
+	// SaveWithGuard 在写入前执行一组"字段守卫"校验（必填、版本号唯一性、MD5 长度、size >= 0 等）。
+	// 若 overwrite=true，会覆盖同 ID 旧记录，否则遇到重复会返回 ErrConflict。
+	SaveWithGuard(f *model.Firmware, overwrite bool) error
 }
 
 // DeviceStore 设备存储接口。
