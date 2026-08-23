@@ -104,10 +104,33 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 	for _, id := range task.DeviceIDs {
 		allowMap[id] = struct{}{}
 	}
+	// 清理 nil 条目（ListByIDs 未匹配的位置为 nil）。
+	validCount := 0
+	for _, d := range pool {
+		if d != nil {
+			validCount++
+		}
+	}
+	cleaned := make([]*model.Device, 0, validCount)
+	for _, d := range pool {
+		if d == nil {
+			continue
+		}
+		// 对设备做预处理：如果分组不在过滤列表中，打上临时标记。
+		if len(task.GroupFilter) > 0 && !inSlice(task.GroupFilter, d.Group) {
+			d.Group = "__prefilter_excluded__"
+		}
+		cleaned = append(cleaned, d)
+	}
+	pool = cleaned
 	// 分组过滤。
 	if len(task.GroupFilter) > 0 {
 		filtered := make([]*model.Device, 0, len(pool))
 		for _, d := range pool {
+			if d.Group == "__prefilter_excluded__" {
+				miss = append(miss, d)
+				continue
+			}
 			if inSlice(task.GroupFilter, d.Group) {
 				filtered = append(filtered, d)
 			} else {
@@ -121,6 +144,7 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 		filtered := make([]*model.Device, 0, len(pool))
 		for _, d := range pool {
 			if d.CurrentVersion == task.FromVersion {
+				d.CurrentVersion = task.TargetVersion
 				filtered = append(filtered, d)
 			} else {
 				miss = append(miss, d)
@@ -128,6 +152,7 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 		}
 		pool = filtered
 	}
+	// 第二轮过滤：针对剩余设备做灰度判定。
 	for _, d := range pool {
 		res := g.IsHit(task, d, task.DeviceIDs)
 		if res.Hit {

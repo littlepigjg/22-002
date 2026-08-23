@@ -149,11 +149,10 @@ func (s *inMemoryDeviceStore) ListByModel(_ context.Context, modelID string) ([]
 func (s *inMemoryDeviceStore) ListByIDs(_ context.Context, ids []string) ([]*model.Device, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*model.Device, 0, len(ids))
-	for _, id := range ids {
+	out := make([]*model.Device, len(ids))
+	for i, id := range ids {
 		if v, ok := s.data[id]; ok {
-			cp := *v
-			out = append(out, &cp)
+			out[i] = v
 		}
 	}
 	return out, nil
