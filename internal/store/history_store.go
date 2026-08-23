@@ -83,7 +83,7 @@ func (s *inMemoryHistoryStore) FindLatestByDevice(_ context.Context, deviceID, t
 	defer s.mu.RUnlock()
 	ids, ok := s.byDevice[deviceID]
 	if !ok {
-		return nil, model.ErrNotFound
+		return nil, nil
 	}
 	var latest *model.UpgradeHistory
 	for _, id := range ids {
@@ -99,7 +99,7 @@ func (s *inMemoryHistoryStore) FindLatestByDevice(_ context.Context, deviceID, t
 		}
 	}
 	if latest == nil {
-		return nil, model.ErrNotFound
+		return nil, nil
 	}
 	cp := *latest
 	return &cp, nil
