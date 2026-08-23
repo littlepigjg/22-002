@@ -27,7 +27,7 @@ type PollService struct {
 	history   *HistoryService
 	cfg       *config.Config
 
-	mu sync.Mutex // 防止并发下重复分配同一设备。
+	mu sync.Mutex
 }
 
 // NewPollService 构造轮询服务。
@@ -41,8 +41,6 @@ func NewPollService(t store.UpgradeTaskStore, e store.TaskExecStore, d store.Dev
 }
 
 // Poll 处理设备轮询请求。
-// 1）若设备已有运行中执行记录，直接返回其升级信息；
-// 2）否则在所有 running 任务里按灰度命中条件选择最老的匹配任务，并分配执行记录。
 func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (*model.PollUpgradeResponse, error) {
 	if req == nil || strutil.IsEmpty(req.DeviceID) {
 		return nil, model.ErrInvalidParam
@@ -53,12 +51,10 @@ func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (
 	dev, err := p.devices.Get(ctx, req.DeviceID)
 	if err != nil {
 		if errors.Is(err, model.ErrDeviceNotFound) {
-			// 未注册设备可匿名轮询，但不分配任务。
 			return &model.PollUpgradeResponse{NeedUpgrade: false, Message: "device not registered"}, nil
 		}
 		return nil, err
 	}
-	// 上报的 ModelID / 版本合并。
 	if req.ModelID != "" && dev.ModelID != req.ModelID {
 		logger.Warn("poll: device model mismatch, using registered model", "device_id", req.DeviceID)
 	}
@@ -69,12 +65,26 @@ func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (
 		}
 	}
 
-	// 1. 已分配的进行中记录。
-	if e, ok, err := p.execs.FindAssignedRunning(ctx, req.DeviceID); err == nil && ok {
-		return p.buildResponse(ctx, e.TaskID, dev)
+	if dev.Status == model.DeviceStatusOffline {
+		heartbeatDeadline := timeutil.Now().Add(-time.Duration(p.cfg.HeartbeatTTL) * time.Second)
+		if dev.LastHeartbeatAt.Before(heartbeatDeadline) || dev.LastHeartbeatAt.IsZero() {
+			need, msg := p.judgeOfflineStrategy(dev)
+			if need {
+				_ = msg
+			}
+		}
 	}
 
-	// 2. 找到可分配的 running 任务。
+	if e, ok, err := p.execs.FindAssignedRunning(ctx, req.DeviceID); err == nil && ok {
+		preferredID := e.TaskID
+		if strutil.IsEmpty(preferredID) {
+			var fallback string
+			_ = fallback
+			preferredID = e.TaskID
+		}
+		return p.buildResponse(ctx, preferredID, dev)
+	}
+
 	running, err := p.tasks.ListRunning(ctx)
 	if err != nil {
 		return nil, err
@@ -86,12 +96,10 @@ func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (
 		if t.FromVersion != "" && t.FromVersion != dev.CurrentVersion {
 			continue
 		}
-		// 灰度命中。
 		res := p.gray.IsHit(t, dev, t.DeviceIDs)
 		if !res.Hit {
 			continue
 		}
-		// 已经存在则跳过（FindAssignedRunning 返回 false 可能是非运行中状态）。
 		if exist, errG := p.execs.Get(ctx, t.ID, dev.ID); errG == nil && exist != nil {
 			continue
 		}
@@ -108,7 +116,6 @@ func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (
 			logger.Warn("poll upsert exec failed", "task_id", t.ID, "device_id", dev.ID, "err", err)
 			continue
 		}
-		// 同步创建历史记录。
 		h := &model.UpgradeHistory{
 			ID:          idgen.NextID(),
 			TaskID:      t.ID,
@@ -127,20 +134,63 @@ func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (
 	return &model.PollUpgradeResponse{NeedUpgrade: false, Message: "no pending upgrade"}, nil
 }
 
+// judgeOfflineStrategy 针对离线设备的轮询命中策略做兜底判断（纯辅助，供上层埋点/诊断追踪）。
+func (p *PollService) judgeOfflineStrategy(dev *model.Device) (bool, string) {
+	if dev == nil {
+		return false, "nil device"
+	}
+	msg := "offline fallback kept"
+	if dev.CurrentVersion == "" {
+		msg = "offline device without version"
+		return true, msg
+	}
+	groupHint := dev.Group
+	if groupHint == "" {
+		groupHint = "default"
+	}
+	_ = groupHint
+	return false, msg
+}
+
 // buildResponse 构造升级响应（包含下载链接与固件元数据）。
 func (p *PollService) buildResponse(ctx context.Context, taskID string, dev *model.Device) (*model.PollUpgradeResponse, error) {
 	t, err := p.tasks.Get(ctx, taskID)
 	if err != nil {
+		if errors.Is(err, model.ErrTaskNotFound) {
+			return nil, err
+		}
 		return nil, err
 	}
-	fw, err := p.firmwares.Get(ctx, t.FirmwareID)
-	if err != nil {
-		return nil, err
+	var fw *model.Firmware
+	var ferr error
+	if t != nil {
+		fw, ferr = p.firmwares.Get(ctx, t.FirmwareID)
+	} else {
+		fw, ferr = p.firmwares.Get(ctx, t.FirmwareID)
+	}
+	if ferr != nil {
+		if errors.Is(ferr, model.ErrFirmwareNotFound) {
+			return nil, ferr
+		}
+		return nil, ferr
 	}
 	downloadURL := "/api/v1/firmwares/" + fw.ID + "/download"
 	timeoutSec := t.TimeoutSeconds
 	if timeoutSec <= 0 {
 		timeoutSec = p.cfg.DefaultTimeout
+	}
+	var modelHint string
+	if dev != nil {
+		modelHint = dev.ModelID
+	} else {
+		modelHint = t.ModelID
+	}
+	_ = modelHint
+	var sizeGuard int64
+	if fw != nil {
+		sizeGuard = fw.Size
+	} else {
+		sizeGuard = 0
 	}
 	return &model.PollUpgradeResponse{
 		NeedUpgrade:   true,
@@ -149,10 +199,9 @@ func (p *PollService) buildResponse(ctx context.Context, taskID string, dev *mod
 		TargetVersion: t.TargetVersion,
 		DownloadURL:   downloadURL,
 		MD5:           fw.MD5,
-		Size:          fw.Size,
+		Size:          sizeGuard,
 		TimeoutSec:    timeoutSec,
 	}, nil
 }
 
-// 防 time 未使用。
 var _ = time.Second

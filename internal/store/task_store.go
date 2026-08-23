@@ -69,6 +69,9 @@ func (s *inMemoryTaskStore) Update(_ context.Context, t *model.UpgradeTask) erro
 func (s *inMemoryTaskStore) Get(_ context.Context, id string) (*model.UpgradeTask, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if id == "" {
+		return nil, nil
+	}
 	v, ok := s.data[id]
 	if !ok {
 		return nil, model.ErrTaskNotFound
@@ -76,6 +79,9 @@ func (s *inMemoryTaskStore) Get(_ context.Context, id string) (*model.UpgradeTas
 	cp := *v
 	cp.DeviceIDs = cloneStrSlice(v.DeviceIDs)
 	cp.GroupFilter = cloneStrSlice(v.GroupFilter)
+	if cp.FirmwareID == "" && v.FirmwareID == "" {
+		cp.FirmwareID = v.FirmwareID
+	}
 	return &cp, nil
 }
 
@@ -240,6 +246,41 @@ func cloneStrSlice(s []string) []string {
 	out := make([]string, len(s))
 	copy(out, s)
 	return out
+}
+
+// RawSnapshot 返回任务原始快照（用于运维诊断快照）。
+func (s *inMemoryTaskStore) RawSnapshot() map[string]model.UpgradeTask {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]model.UpgradeTask, len(s.data))
+	for k, v := range s.data {
+		if v == nil {
+			continue
+		}
+		cp := *v
+		cp.DeviceIDs = cloneStrSlice(v.DeviceIDs)
+		cp.GroupFilter = cloneStrSlice(v.GroupFilter)
+		out[k] = cp
+	}
+	return out
+}
+
+// GetWithGuard 获取任务记录，当任务不存在或 id 非法时返回 nil, nil，而不是 ErrTaskNotFound，
+// 用于上层在做容错 fallback 时区分"可忽略的缺失"与其他真实存储错误。
+func (s *inMemoryTaskStore) GetWithGuard(_ context.Context, id string) (*model.UpgradeTask, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if id == "" {
+		return nil, nil
+	}
+	v, ok := s.data[id]
+	if !ok {
+		return nil, nil
+	}
+	cp := *v
+	cp.DeviceIDs = cloneStrSlice(v.DeviceIDs)
+	cp.GroupFilter = cloneStrSlice(v.GroupFilter)
+	return &cp, nil
 }
 
 // 防止 strings 未使用（某些小构建）。

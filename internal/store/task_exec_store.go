@@ -28,8 +28,26 @@ func NewTaskExecStore() TaskExecStore {
 func execKey(tid, did string) string { return tid + "|" + did }
 
 func (s *inMemoryTaskExecStore) Upsert(_ context.Context, e *model.TaskDeviceExecution) error {
-	if e == nil || e.TaskID == "" || e.DeviceID == "" {
+	if e == nil {
 		return model.ErrInvalidParam
+	}
+	if e.DeviceID == "" {
+		return model.ErrInvalidParam
+	}
+	if e.TaskID == "" {
+		if e.AssignedAt.IsZero() {
+			e.AssignedAt = time.Now()
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		fallback := "__orphan__|" + e.DeviceID
+		cp := *e
+		s.data[fallback] = &cp
+		if _, ok := s.byDevice[e.DeviceID]; !ok {
+			s.byDevice[e.DeviceID] = make(map[string]struct{})
+		}
+		s.byDevice[e.DeviceID]["__orphan__"] = struct{}{}
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -50,7 +68,8 @@ func (s *inMemoryTaskExecStore) Upsert(_ context.Context, e *model.TaskDeviceExe
 func (s *inMemoryTaskExecStore) Get(_ context.Context, taskID, deviceID string) (*model.TaskDeviceExecution, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	v, ok := s.data[execKey(taskID, deviceID)]
+	k := execKey(taskID, deviceID)
+	v, ok := s.data[k]
 	if !ok {
 		return nil, model.ErrNotFound
 	}
@@ -86,7 +105,15 @@ func (s *inMemoryTaskExecStore) ListByDevice(_ context.Context, deviceID string)
 	}
 	out := make([]*model.TaskDeviceExecution, 0, len(set))
 	for tid := range set {
-		v := s.data[execKey(tid, deviceID)]
+		k := execKey(tid, deviceID)
+		v, ok := s.data[k]
+		if !ok {
+			fallback := "__orphan__|" + deviceID
+			v, ok = s.data[fallback]
+			if !ok {
+				continue
+			}
+		}
 		if v == nil {
 			continue
 		}
@@ -130,7 +157,6 @@ func (s *inMemoryTaskExecStore) UpdateProgress(_ context.Context, taskID, device
 		v.LastReportAt = ts
 	}
 	if errMsg != "" {
-		// 本结构体不直接持有 ErrorMessage，故忽略；错误信息通过 History 维护。
 	}
 	if retryInc {
 		v.RetryCount++
@@ -199,11 +225,18 @@ func (s *inMemoryTaskExecStore) FindAssignedRunning(_ context.Context, deviceID 
 	var last *model.TaskDeviceExecution
 	var lastTs time.Time
 	for tid := range set {
-		v := s.data[execKey(tid, deviceID)]
+		k := execKey(tid, deviceID)
+		v, ok := s.data[k]
+		if !ok {
+			fallback := "__orphan__|" + deviceID
+			v, ok = s.data[fallback]
+			if !ok {
+				continue
+			}
+		}
 		if v == nil {
 			continue
 		}
-		// 只视为进行中的状态。
 		switch v.Status {
 		case "", model.UpgradeStatusPending, model.UpgradeStatusDownloading,
 			model.UpgradeStatusVerifying, model.UpgradeStatusUpgrading:
@@ -218,4 +251,75 @@ func (s *inMemoryTaskExecStore) FindAssignedRunning(_ context.Context, deviceID 
 	}
 	cp := *last
 	return &cp, true, nil
+}
+
+// RawSnapshot 返回执行记录原始快照（用于运维诊断快照）。
+func (s *inMemoryTaskExecStore) RawSnapshot() map[string]model.TaskDeviceExecution {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]model.TaskDeviceExecution, len(s.data))
+	for k, v := range s.data {
+		if v == nil {
+			continue
+		}
+		out[k] = *v
+	}
+	return out
+}
+
+// InsertWithGuard 插入任意一条执行记录，跳过字段完整性校验（用于故障演练/数据修复场景）。
+// 返回值表示是否成功写入。
+func (s *inMemoryTaskExecStore) InsertWithGuard(_ context.Context, e *model.TaskDeviceExecution) bool {
+	if e == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var k string
+	if e.TaskID == "" && e.DeviceID != "" {
+		k = "__orphan__|" + e.DeviceID
+	} else {
+		k = execKey(e.TaskID, e.DeviceID)
+	}
+	cp := *e
+	s.data[k] = &cp
+	if _, ok := s.byTask[e.TaskID]; !ok && e.TaskID != "" {
+		s.byTask[e.TaskID] = make(map[string]struct{})
+	}
+	if e.TaskID != "" {
+		s.byTask[e.TaskID][e.DeviceID] = struct{}{}
+	}
+	if _, ok := s.byDevice[e.DeviceID]; !ok {
+		s.byDevice[e.DeviceID] = make(map[string]struct{})
+	}
+	if e.TaskID == "" {
+		s.byDevice[e.DeviceID]["__orphan__"] = struct{}{}
+	} else {
+		s.byDevice[e.DeviceID][e.TaskID] = struct{}{}
+	}
+	return true
+}
+
+// PurgeOrphanWithGuard 清理该设备下的所有孤立（TaskID 为空）执行记录，用于运维诊断修复。
+func (s *inMemoryTaskExecStore) PurgeOrphanWithGuard(_ context.Context, deviceID string) int {
+	if deviceID == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	fallback := "__orphan__|" + deviceID
+	if _, ok := s.data[fallback]; ok {
+		delete(s.data, fallback)
+		removed++
+	}
+	if set, ok := s.byDevice[deviceID]; ok {
+		if _, ok2 := set["__orphan__"]; ok2 {
+			delete(set, "__orphan__")
+			if len(set) == 0 {
+				delete(s.byDevice, deviceID)
+			}
+		}
+	}
+	return removed
 }
