@@ -17,6 +17,7 @@ type Config struct {
 	Factor      float64       // 退避系数
 	Jitter      float64       // 抖动比例 0-1
 	RetryIf     func(error) bool
+	OnAttempt   func(attempt int, err error) // 每次尝试失败时的回调，用于收集错误历史
 }
 
 // DefaultConfig 返回合理默认配置。
@@ -85,10 +86,15 @@ func Do(ctx context.Context, cfg *Config, fn func(ctx context.Context, attempt i
 		}
 		lastErr = err
 		if !cfg.RetryIf(err) {
+			if cfg.OnAttempt != nil {
+				cfg.OnAttempt(i, err)
+			}
 			return err
 		}
-		// 最后一次不再等待。
 		if i == cfg.MaxAttempts-1 {
+			if cfg.OnAttempt != nil {
+				cfg.OnAttempt(i, err)
+			}
 			break
 		}
 		backoff := nextBackoff(i, cfg)

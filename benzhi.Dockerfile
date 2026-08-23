@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.6
 #
 # benzhi.Dockerfile —— 本 Zhi 评测专用多阶段构建镜像（纯 Go，不暴露任何第三方依赖）。
 #
@@ -14,7 +13,7 @@
 ARG GO_VERSION=1.22
 ARG ALPINE_VERSION=3.20
 
-FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
+FROM docker.m.daocloud.io/library/golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 
 # 评测环境在国内时，可通过 --build-arg GOPROXY=https://goproxy.cn,direct 切换
 ARG GOPROXY=https://proxy.golang.org,direct
@@ -30,13 +29,15 @@ ENV GOPROXY=${GOPROXY} \
 
 WORKDIR /src
 
-# 依赖层缓存：先拷贝 go.mod / go.sum 再下载
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download && go mod verify
+# 先拷贝 go.mod
+COPY go.mod ./
 
 # 拷贝全部源码
 COPY . .
+
+# 依赖层缓存
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod tidy && go mod download && go mod verify
 
 # 构建：关闭 CGO、移除调试符号，输出 /out/server
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -50,7 +51,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     echo "built: $(ls -l /out/server)"
 
 # 2) 运行镜像 -----------------------------------------------------------
-FROM alpine:${ALPINE_VERSION} AS runner
+FROM docker.m.daocloud.io/library/alpine:${ALPINE_VERSION} AS runner
 
 ARG APP_UID=10001
 ARG APP_GID=10001
@@ -78,9 +79,6 @@ WORKDIR /app
 
 # 二进制
 COPY --from=builder /out/server /app/server
-
-# 前端静态资源目录（若构建时已内嵌 go:embed 则无需复制；这里也保留显式目录兜底）
-COPY web /app/web
 
 # 运行用户与暴露端口
 USER ${APP_UID}:${APP_GID}

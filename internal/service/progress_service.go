@@ -11,6 +11,7 @@ import (
 	"firmware-upgrade/internal/model"
 	"firmware-upgrade/internal/store"
 	"firmware-upgrade/pkg/logger"
+	"firmware-upgrade/pkg/retry"
 	"firmware-upgrade/pkg/strutil"
 	"firmware-upgrade/pkg/timeutil"
 )
@@ -26,6 +27,11 @@ type ProgressService struct {
 
 	// 设备级互斥：避免对同一设备的多次上报乱序写入进度。
 	deviceMu sync.Map // map[string]*sync.Mutex
+
+	// retryOnAttempt 重试错误收集回调
+	retryOnAttempt func(attempt int, err error)
+	// retryErrorHistory 收集到的重试错误历史
+	retryErrorHistory []error
 }
 
 // NewProgressService 创建进度服务。
@@ -41,6 +47,21 @@ func NewProgressService(e store.TaskExecStore, t store.UpgradeTaskStore, d store
 func (p *ProgressService) deviceLock(id string) *sync.Mutex {
 	v, _ := p.deviceMu.LoadOrStore(id, &sync.Mutex{})
 	return v.(*sync.Mutex)
+}
+
+// SetRetryOnAttempt 设置重试错误收集回调。
+func (p *ProgressService) SetRetryOnAttempt(fn func(attempt int, err error)) {
+	p.retryOnAttempt = fn
+}
+
+// GetRetryErrorHistory 获取收集到的重试错误历史。
+func (p *ProgressService) GetRetryErrorHistory() []error {
+	return p.retryErrorHistory
+}
+
+// ClearRetryErrorHistory 清空重试错误历史。
+func (p *ProgressService) ClearRetryErrorHistory() {
+	p.retryErrorHistory = nil
 }
 
 // Report 处理上报请求。返回更新后的执行记录。
@@ -84,8 +105,12 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 	if err := p.execs.UpdateProgress(ctx, req.TaskID, req.DeviceID, req.Status, req.Progress, now, errMsg, retryInc); err != nil {
 		return nil, err
 	}
-	// 更新历史记录。
-	if h, err := p.histories.FindLatestByDevice(ctx, req.DeviceID, req.TaskID); err == nil {
+	// 更新历史记录，使用 retry.Do 进行重试。
+	updateHistory := func() error {
+		h, err := p.histories.FindLatestByDevice(ctx, req.DeviceID, req.TaskID)
+		if err != nil {
+			return err
+		}
 		h.Status = req.Status
 		h.Progress = req.Progress
 		if req.ErrorMessage != "" {
@@ -105,14 +130,33 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 				h.DurationMs = now.Sub(h.StartedAt).Milliseconds()
 			}
 			if req.Status == model.UpgradeStatusSuccess {
-				// 升级成功：更新设备当前版本。
 				_ = p.devices.UpdateVersion(ctx, req.DeviceID, t.TargetVersion)
 			}
 		}
-		if err := p.histories.Update(ctx, h); err != nil {
-			logger.Warn("update history failed", "task_id", req.TaskID, "device_id", req.DeviceID, "err", err)
-		}
+		return p.histories.Update(ctx, h)
 	}
+
+	retryCfg := &retry.Config{
+		MaxAttempts: 3,
+		Base:        10 * time.Millisecond,
+		MaxBackoff: 50 * time.Millisecond,
+		Factor:      1.0,
+		Jitter:      0,
+		RetryIf:     func(err error) bool { return err != nil },
+		OnAttempt: func(attempt int, err error) {
+			if p.retryOnAttempt != nil {
+				p.retryErrorHistory = append(p.retryErrorHistory, err)
+				p.retryOnAttempt(attempt, err)
+			}
+		},
+	}
+
+	if err := retry.Do(ctx, retryCfg, func(ctx context.Context, attempt int) error {
+		return updateHistory()
+	}); err != nil {
+		logger.Warn("update history failed after retry", "task_id", req.TaskID, "device_id", req.DeviceID, "err", err)
+	}
+
 	// 刷新任务进度（串行：避免大量上报造成高频锁竞争）。
 	if req.Status != model.UpgradeStatusDownloading && req.Status != model.UpgradeStatusUpgrading ||
 		req.Progress%10 == 0 || req.Progress == 100 {
