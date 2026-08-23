@@ -34,9 +34,14 @@ func NewServices(cfg *config.Config, s *store.Container) *Services {
 		svc.FileOp = NewFileOpService(nil)
 		svc.Firmware = NewFirmwareService(s.Firmwares, s.Models, svc.FileOp, nil)
 		svc.History = NewHistoryService(s.Histories)
+		// 快速启动（nil cfg 走默认装配）时同样装配统计服务，
+		// 否则 Task/Progress 持有的 stats 为 nil，状态流转中调用
+		// Invalidate() 会 nil pointer dereference 直接 panic。
+		// NewStatsService 内部对 nil cfg 会回退到 config.Default()。
+		svc.Stats = NewStatsService(s, svc.History, nil)
 		svc.Gray = NewGrayService(s.Devices, nil)
-		svc.Task = NewTaskService(s.Tasks, s.Execs, s.Devices, s.Firmwares, s.Models, svc.Gray, svc.History, nil, nil)
-		svc.Progress = NewProgressService(s.Execs, s.Tasks, s.Devices, s.Histories, nil, nil)
+		svc.Task = NewTaskService(s.Tasks, s.Execs, s.Devices, s.Firmwares, s.Models, svc.Gray, svc.History, svc.Stats, nil)
+		svc.Progress = NewProgressService(s.Execs, s.Tasks, s.Devices, s.Histories, svc.Stats, nil)
 		svc.Poll = NewPollService(s.Tasks, s.Execs, s.Devices, s.Firmwares, svc.Gray, svc.Progress, svc.History, nil)
 		return svc
 	}

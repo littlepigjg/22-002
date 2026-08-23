@@ -120,13 +120,23 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 		}
 	}
 	if req.Progress == 100 && req.Status == model.UpgradeStatusSuccess {
-		p.stats.Invalidate()
+		p.invalidateStats()
 	} else if req.Status == model.UpgradeStatusFailed || req.Status == model.UpgradeStatusCanceled {
-		p.stats.Invalidate()
+		p.invalidateStats()
 	} else {
-		p.stats.Invalidate()
+		p.invalidateStats()
 	}
 	return p.execs.Get(ctx, req.TaskID, req.DeviceID)
+}
+
+// invalidateStats 失效统计缓存；stats 未装配（如 nil cfg 快速启动异常装配）
+// 时直接跳过，避免 nil pointer dereference 中断上报流程。统计为最佳努力型
+// 副作用，不应阻塞业务结果写回存储。
+func (p *ProgressService) invalidateStats() {
+	if p.stats == nil {
+		return
+	}
+	p.stats.Invalidate()
 }
 
 func (p *ProgressService) ScanTimeout(ctx context.Context) int {
@@ -191,7 +201,7 @@ func (p *ProgressService) ScanTimeout(ctx context.Context) int {
 		}
 	}
 	if handled > 0 {
-		p.stats.Invalidate()
+		p.invalidateStats()
 	}
 	return handled
 }

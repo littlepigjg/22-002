@@ -188,8 +188,18 @@ func (s *TaskService) assignInitialExecutions(ctx context.Context, t *model.Upgr
 		}
 	}
 	_ = s.tasks.UpdateProgress(ctx, t.ID, progress)
-	s.stats.Invalidate()
+	s.invalidateStats()
 	return nil
+}
+
+// invalidateStats 失效统计缓存；stats 未装配（如 nil cfg 快速启动异常装配）
+// 时直接跳过，避免 nil pointer dereference 中断任务流程。统计为最佳努力型
+// 副作用，不应阻塞业务结果写回存储。
+func (s *TaskService) invalidateStats() {
+	if s.stats == nil {
+		return
+	}
+	s.stats.Invalidate()
 }
 
 func (s *TaskService) Get(ctx context.Context, id string) (*model.UpgradeTask, error) {
@@ -284,7 +294,7 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 	if err := s.tasks.Update(ctx, t); err != nil {
 		return nil, err
 	}
-	s.stats.Invalidate()
+	s.invalidateStats()
 	return s.tasks.Get(ctx, id)
 }
 
@@ -339,7 +349,7 @@ func (s *TaskService) Delete(ctx context.Context, id string) error {
 	if err := s.tasks.Delete(ctx, id); err != nil {
 		return err
 	}
-	s.stats.Invalidate()
+	s.invalidateStats()
 	return nil
 }
 
@@ -360,7 +370,7 @@ func (s *TaskService) RefreshProgress(ctx context.Context, taskID string) error 
 		Timeout:  int(timeout),
 	})
 	if errU == nil {
-		s.stats.Invalidate()
+		s.invalidateStats()
 	}
 	return errU
 }
@@ -397,7 +407,7 @@ func (s *TaskService) StartDueTasks(ctx context.Context) int {
 		}
 	}
 	if started > 0 {
-		s.stats.Invalidate()
+		s.invalidateStats()
 	}
 	return started
 }
