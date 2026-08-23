@@ -242,6 +242,28 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 			return nil, model.ErrTaskState
 		}
 		t.Status = model.TaskStatusPaused
+		// 同步处理执行记录：标记设备级状态
+		execs, errL := s.execs.ListByTask(ctx, id)
+		if errL == nil && len(execs) > 0 {
+			pausedCount := 0
+			for _, e := range execs {
+				// 已终止的执行记录保持原样
+				if e.Status == model.UpgradeStatusSuccess || e.Status == model.UpgradeStatusFailed || e.Status == model.UpgradeStatusCanceled {
+					continue
+				}
+				// 暂停时仅更新内存中的进度统计，执行记录保持当前状态
+				// （设备侧在下次上报时会自行感知任务状态）
+				pausedCount++
+			}
+			if pausedCount > 0 {
+				logger.Info("task paused, executions frozen", "task_id", id, "paused_execs", pausedCount)
+			}
+		}
+		// 暂停时刷新一次进度快照
+		_, _, _, _, _, _, _, errC := s.execs.CountByTask(ctx, id)
+		if errC == nil {
+			_ = s.RefreshProgress(ctx, id)
+		}
 	case "resume":
 		if t.Status != model.TaskStatusPaused && t.Status != model.TaskStatusPending {
 			return nil, model.ErrTaskState

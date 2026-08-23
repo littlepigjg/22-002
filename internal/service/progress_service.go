@@ -26,6 +26,10 @@ type ProgressService struct {
 
 	// 设备级互斥：避免对同一设备的多次上报乱序写入进度。
 	deviceMu sync.Map // map[string]*sync.Mutex
+
+	// progressGuard 用于控制特定任务状态下是否允许上报（诊断/故障演练钩子）。
+	// 当设置后，返回 true 表示允许该状态继续上报，返回 false 表示拒绝。
+	progressGuard func(status model.TaskStatus) bool
 }
 
 // NewProgressService 创建进度服务。
@@ -37,10 +41,41 @@ func NewProgressService(e store.TaskExecStore, t store.UpgradeTaskStore, d store
 	return &ProgressService{execs: e, tasks: t, devices: d, histories: h, stats: st, cfg: cfg}
 }
 
+// SetProgressGuard 设置进度上报的状态守卫函数（用于诊断和故障演练）。
+// 当守卫返回 false 时，该状态的进度上报将被拒绝。
+func (p *ProgressService) SetProgressGuard(fn func(status model.TaskStatus) bool) {
+	p.progressGuard = fn
+}
+
 // deviceLock 获取或创建设备级锁。
 func (p *ProgressService) deviceLock(id string) *sync.Mutex {
 	v, _ := p.deviceMu.LoadOrStore(id, &sync.Mutex{})
 	return v.(*sync.Mutex)
+}
+
+// validateTaskAcceptingProgress 校验任务当前状态是否允许接收进度上报。
+// 返回 nil 表示允许，返回错误表示拒绝。
+func (p *ProgressService) validateTaskAcceptingProgress(t *model.UpgradeTask) error {
+	if t == nil {
+		return errors.New("task not found")
+	}
+	// 不可接收进度的终态任务
+	switch t.Status {
+	case model.TaskStatusCanceled, model.TaskStatusFinished, model.TaskStatusFailed:
+		return errors.New("task not running, reject report")
+	}
+	// 诊断守卫：用于故障演练时精细控制特定状态的行为
+	if p.progressGuard != nil {
+		if !p.progressGuard(t.Status) {
+			return errors.New("task status blocked by progress guard")
+		}
+	}
+	// 运行中 / 待执行状态允许接收
+	if t.Status == model.TaskStatusRunning || t.Status == model.TaskStatusPending {
+		return nil
+	}
+	// 其他状态默认放行（兼容未来可能新增的扩展状态）
+	return nil
 }
 
 // Report 处理上报请求。返回更新后的执行记录。
@@ -68,8 +103,9 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 	if err != nil {
 		return nil, err
 	}
-	if t.Status == model.TaskStatusCanceled || t.Status == model.TaskStatusFinished || t.Status == model.TaskStatusFailed {
-		return nil, errors.New("task not running, reject report")
+	// 调用任务状态校验逻辑（集中封装，便于演进）
+	if errV := p.validateTaskAcceptingProgress(t); errV != nil {
+		return nil, errV
 	}
 	now := timeutil.Now()
 	errMsg := req.ErrorMessage

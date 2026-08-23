@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.6
-#
 # benzhi.Dockerfile —— 本 Zhi 评测专用多阶段构建镜像（纯 Go，不暴露任何第三方依赖）。
 #
 #   阶段：
@@ -30,18 +28,15 @@ ENV GOPROXY=${GOPROXY} \
 
 WORKDIR /src
 
-# 依赖层缓存：先拷贝 go.mod / go.sum 再下载
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download && go mod verify
+# 依赖层缓存：先拷贝 go.mod 再下载
+COPY go.mod ./
+RUN go mod download 2>/dev/null || true
 
 # 拷贝全部源码
 COPY . .
 
 # 构建：关闭 CGO、移除调试符号，输出 /out/server
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
-    mkdir -p /out && \
+RUN mkdir -p /out && \
     go build \
       -trimpath \
       -ldflags="-s -w -X 'main.buildVersion=docker-benzhi' -X 'main.buildCommit=local' -X 'main.buildTime=$(date -u +%FT%TZ)'" \

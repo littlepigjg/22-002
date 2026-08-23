@@ -28,6 +28,9 @@ type PollService struct {
 	cfg       *config.Config
 
 	mu sync.Mutex // 防止并发下重复分配同一设备。
+
+	// pollGuard 用于控制在轮询时哪些任务状态可以被接受（诊断/故障演练钩子）。
+	pollGuard func(status model.TaskStatus) bool
 }
 
 // NewPollService 构造轮询服务。
@@ -38,6 +41,37 @@ func NewPollService(t store.UpgradeTaskStore, e store.TaskExecStore, d store.Dev
 		cfg = config.Default()
 	}
 	return &PollService{tasks: t, execs: e, devices: d, firmwares: f, gray: g, progress: p, history: h, cfg: cfg}
+}
+
+// SetPollGuard 设置轮询时的任务状态守卫函数（用于诊断和故障演练）。
+// 当守卫返回 false 时，该状态的任务将不被接受为有效分配。
+func (p *PollService) SetPollGuard(fn func(status model.TaskStatus) bool) {
+	p.pollGuard = fn
+}
+
+// validatePollTaskStatus 校验轮询时任务状态是否允许分配/返回升级信息。
+// 返回 nil 表示允许，返回错误表示拒绝。
+func (p *PollService) validatePollTaskStatus(t *model.UpgradeTask) error {
+	if t == nil {
+		return errors.New("task not found")
+	}
+	// 已终止的任务不再分配
+	switch t.Status {
+	case model.TaskStatusCanceled, model.TaskStatusFinished, model.TaskStatusFailed:
+		return errors.New("task terminated")
+	}
+	// 诊断守卫：用于故障演练时精细控制
+	if p.pollGuard != nil {
+		if !p.pollGuard(t.Status) {
+			return errors.New("task status blocked by poll guard")
+		}
+	}
+	// 运行中状态的任务允许分配
+	if t.Status == model.TaskStatusRunning {
+		return nil
+	}
+	// 其他状态默认放行（兼容未来扩展）
+	return nil
 }
 
 // Poll 处理设备轮询请求。
@@ -71,6 +105,13 @@ func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (
 
 	// 1. 已分配的进行中记录。
 	if e, ok, err := p.execs.FindAssignedRunning(ctx, req.DeviceID); err == nil && ok {
+		t, errT := p.tasks.Get(ctx, e.TaskID)
+		if errT == nil {
+			// 使用统一的任务状态校验逻辑
+			if errV := p.validatePollTaskStatus(t); errV != nil {
+				return &model.PollUpgradeResponse{NeedUpgrade: false, Message: errV.Error()}, nil
+			}
+		}
 		return p.buildResponse(ctx, e.TaskID, dev)
 	}
 
