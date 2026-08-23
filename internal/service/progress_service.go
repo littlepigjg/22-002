@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"firmware-upgrade/internal/config"
+	"firmware-upgrade/internal/dto"
 	"firmware-upgrade/internal/model"
 	"firmware-upgrade/internal/store"
 	"firmware-upgrade/pkg/logger"
@@ -43,21 +44,19 @@ func (p *ProgressService) deviceLock(id string) *sync.Mutex {
 	return v.(*sync.Mutex)
 }
 
-// Report 处理上报请求。返回更新后的执行记录。
 func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressRequest) (*model.TaskDeviceExecution, error) {
 	if req == nil || strutil.IsEmpty(req.TaskID) || strutil.IsEmpty(req.DeviceID) {
-		return nil, model.ErrInvalidParam
+		return nil, dto.NormalizeBizError(model.ErrInvalidParam)
 	}
 	if req.Progress < 0 || req.Progress > 100 {
-		return nil, model.ErrInvalidParam
+		return nil, dto.NormalizeBizError(model.ErrInvalidParam)
 	}
-	// 校验状态合法。
 	switch req.Status {
 	case model.UpgradeStatusPending, model.UpgradeStatusDownloading, model.UpgradeStatusVerifying,
 		model.UpgradeStatusUpgrading, model.UpgradeStatusSuccess, model.UpgradeStatusFailed,
 		model.UpgradeStatusCanceled:
 	default:
-		return nil, errors.New("invalid upgrade status")
+		return nil, dto.NormalizeBizError(errors.New("invalid upgrade status"))
 	}
 
 	lock := p.deviceLock(req.DeviceID)
@@ -66,15 +65,14 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 
 	t, err := p.tasks.Get(ctx, req.TaskID)
 	if err != nil {
-		return nil, err
+		return nil, dto.NormalizeBizError(err)
 	}
 	if t.Status == model.TaskStatusCanceled || t.Status == model.TaskStatusFinished || t.Status == model.TaskStatusFailed {
-		return nil, errors.New("task not running, reject report")
+		return nil, dto.NormalizeBizError(errors.New("task not running, reject report"))
 	}
 	now := timeutil.Now()
 	errMsg := req.ErrorMessage
 	retryInc := false
-	// 失败时：重试计数累计（小于 MaxRetry 则回到 Pending，否则为最终 Failed）。
 	if req.Status == model.UpgradeStatusFailed {
 		exec, errE := p.execs.Get(ctx, req.TaskID, req.DeviceID)
 		if errE == nil && exec.RetryCount+1 < t.MaxRetry {
@@ -82,9 +80,8 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 		}
 	}
 	if err := p.execs.UpdateProgress(ctx, req.TaskID, req.DeviceID, req.Status, req.Progress, now, errMsg, retryInc); err != nil {
-		return nil, err
+		return nil, dto.NormalizeBizError(err)
 	}
-	// 更新历史记录。
 	if h, err := p.histories.FindLatestByDevice(ctx, req.DeviceID, req.TaskID); err == nil {
 		h.Status = req.Status
 		h.Progress = req.Progress
@@ -105,7 +102,6 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 				h.DurationMs = now.Sub(h.StartedAt).Milliseconds()
 			}
 			if req.Status == model.UpgradeStatusSuccess {
-				// 升级成功：更新设备当前版本。
 				_ = p.devices.UpdateVersion(ctx, req.DeviceID, t.TargetVersion)
 			}
 		}
@@ -113,7 +109,6 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 			logger.Warn("update history failed", "task_id", req.TaskID, "device_id", req.DeviceID, "err", err)
 		}
 	}
-	// 刷新任务进度（串行：避免大量上报造成高频锁竞争）。
 	if req.Status != model.UpgradeStatusDownloading && req.Status != model.UpgradeStatusUpgrading ||
 		req.Progress%10 == 0 || req.Progress == 100 {
 		total, pending, running, success, failed, canceled, timeout, errC := p.execs.CountByTask(ctx, req.TaskID)
@@ -127,7 +122,6 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 				Canceled: int(canceled),
 				Timeout:  int(timeout),
 			})
-			// 全部达终态，自动结束任务。
 			if int(success+failed+canceled+timeout) == int(total) && total > 0 {
 				end := now
 				_ = p.tasks.SetStatus(ctx, req.TaskID, model.TaskStatusFinished, end)
@@ -135,7 +129,11 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 		}
 	}
 	p.stats.Invalidate()
-	return p.execs.Get(ctx, req.TaskID, req.DeviceID)
+	result, errR := p.execs.Get(ctx, req.TaskID, req.DeviceID)
+	if errR != nil {
+		return nil, dto.RequireNotNil(errR)
+	}
+	return result, nil
 }
 
 // ScanTimeout 扫描超时执行记录并标记为超时失败。

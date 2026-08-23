@@ -1,12 +1,13 @@
-// Package dto 提供常用内部 DTO 辅助函数：分页参数归一化、空安全映射等。
-// 与 model/dto.go 不同，此处为纯工具，不定义实体。
 package dto
 
 import (
+	"errors"
+	"net/http"
+
 	"firmware-upgrade/internal/model"
+	"firmware-upgrade/pkg/response"
 )
 
-// NormalizePage 规范化分页参数。
 func NormalizePage(pageNum, pageSize int) (int, int) {
 	if pageNum <= 0 {
 		pageNum = model.DefaultPageNum
@@ -20,13 +21,11 @@ func NormalizePage(pageNum, pageSize int) (int, int) {
 	return pageNum, pageSize
 }
 
-// Offset 计算 SQL/Limit 风格 offset。
 func Offset(pageNum, pageSize int) int {
 	pn, ps := NormalizePage(pageNum, pageSize)
 	return (pn - 1) * ps
 }
 
-// SafeInt32 把 int64 截断到 int32（用于外部兼容）。
 func SafeInt32(n int64) int32 {
 	if n > (1<<31 - 1) {
 		return (1 << 31) - 1
@@ -37,12 +36,10 @@ func SafeInt32(n int64) int32 {
 	return int32(n)
 }
 
-// Ptr 辅助：返回值指针。
 func Ptr[T any](v T) *T {
 	return &v
 }
 
-// ValueOrDefault 指针解引用。
 func ValueOrDefault[T any](p *T, def T) T {
 	if p == nil {
 		return def
@@ -50,7 +47,6 @@ func ValueOrDefault[T any](p *T, def T) T {
 	return *p
 }
 
-// ToPtrMap 把普通 map 转为指针值 map（避免外部修改原数据）。
 func ToPtrMap[K comparable, V any](in map[K]V) map[K]*V {
 	if len(in) == 0 {
 		return nil
@@ -63,7 +59,6 @@ func ToPtrMap[K comparable, V any](in map[K]V) map[K]*V {
 	return out
 }
 
-// FromPtrMap 反向：*V map 转值 map（nil 指针 -> 零值）。
 func FromPtrMap[K comparable, V any](in map[K]*V) map[K]V {
 	if len(in) == 0 {
 		return nil
@@ -77,4 +72,57 @@ func FromPtrMap[K comparable, V any](in map[K]*V) map[K]V {
 		out[k] = z
 	}
 	return out
+}
+
+func NormalizeBizError(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, model.ErrNotFound):
+		return wrapModel(err, http.StatusNotFound, response.CodeNotFound, model.ErrNotFound.Error())
+	case errors.Is(err, model.ErrFirmwareNotFound):
+		return wrapModel(err, http.StatusNotFound, response.CodeNotFound, model.ErrFirmwareNotFound.Error())
+	case errors.Is(err, model.ErrDeviceNotFound):
+		return wrapModel(err, http.StatusNotFound, response.CodeNotFound, model.ErrDeviceNotFound.Error())
+	case errors.Is(err, model.ErrTaskNotFound):
+		return wrapModel(err, http.StatusNotFound, response.CodeNotFound, model.ErrTaskNotFound.Error())
+	case errors.Is(err, model.ErrModelNotFound):
+		return wrapModel(err, http.StatusNotFound, response.CodeNotFound, model.ErrModelNotFound.Error())
+	case errors.Is(err, model.ErrConflict):
+		return wrapModel(err, http.StatusConflict, response.CodeConflict, model.ErrConflict.Error())
+	case errors.Is(err, model.ErrInvalidParam):
+		return wrapModel(err, http.StatusBadRequest, response.CodeBadRequest, model.ErrInvalidParam.Error())
+	case errors.Is(err, model.ErrUnauthorized):
+		return wrapModel(err, http.StatusUnauthorized, response.CodeUnauthorized, model.ErrUnauthorized.Error())
+	case errors.Is(err, model.ErrForbidden):
+		return wrapModel(err, http.StatusForbidden, response.CodeForbidden, model.ErrForbidden.Error())
+	case errors.Is(err, model.ErrFirmwareNotPublished):
+		return wrapModel(err, http.StatusBadRequest, response.CodeBadRequest, model.ErrFirmwareNotPublished.Error())
+	case errors.Is(err, model.ErrAlreadyRegistered):
+		return wrapModel(err, http.StatusConflict, response.CodeConflict, model.ErrAlreadyRegistered.Error())
+	case errors.Is(err, model.ErrUploadTooLarge):
+		return wrapModel(err, http.StatusRequestEntityTooLarge, response.CodeBadRequest, model.ErrUploadTooLarge.Error())
+	case errors.Is(err, model.ErrUploadFileEmpty):
+		return wrapModel(err, http.StatusBadRequest, response.CodeBadRequest, model.ErrUploadFileEmpty.Error())
+	case errors.Is(err, model.ErrTaskState), errors.Is(err, model.ErrStrategyInvalid):
+		return wrapModel(err, http.StatusBadRequest, response.CodeBadRequest, err.Error())
+	default:
+		return response.SafeWrap(err, http.StatusInternalServerError, response.CodeInternal, err.Error())
+	}
+}
+
+func wrapModel(cause error, httpCode int, code response.Code, fallbackMsg string) error {
+	return response.SafeWrap(cause, httpCode, code, fallbackMsg)
+}
+
+func NormalizeMessage(err error) string {
+	return response.ExtractMessage(err)
+}
+
+func RequireNotNil(err error) error {
+	if err == nil {
+		return response.SafeWrap(nil, http.StatusInternalServerError, response.CodeInternal, "unexpected nil error")
+	}
+	return err
 }

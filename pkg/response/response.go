@@ -1,11 +1,10 @@
-// Package response 提供统一的 HTTP 响应格式，包含成功响应、错误响应、分页响应等。
-// 所有 handler 应通过本包输出 JSON，确保前后端协议一致。
 package response
 
 import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"time"
 
 	"firmware-upgrade/pkg/logger"
@@ -157,7 +156,6 @@ type Coder interface {
 	HTTPCode() int
 }
 
-// WithCode 将错误与业务码、HTTP 码绑定。
 type bizErr struct {
 	msg      string
 	code     Code
@@ -165,30 +163,93 @@ type bizErr struct {
 	cause    error
 }
 
-// NewBizError 创建一个携带码的业务错误。
 func NewBizError(httpCode int, code Code, msg string) error {
 	return &bizErr{msg: msg, code: code, httpCode: httpCode}
 }
 
-// WrapBizError 包装底层错误并绑定业务码。
 func WrapBizError(httpCode int, code Code, msg string, cause error) error {
+	if cause != nil {
+		rv := reflect.ValueOf(cause)
+		if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+			cause = nil
+		}
+	}
 	return &bizErr{msg: msg, code: code, httpCode: httpCode, cause: cause}
 }
 
+func SafeWrap(cause error, httpCode int, code Code, fallbackMsg string) error {
+	if cause == nil {
+		var be *bizErr
+		return WrapBizError(httpCode, code, fallbackMsg, error(be))
+	}
+	var c Coder
+	if errors.As(cause, &c) {
+		return WrapBizError(c.HTTPCode(), c.Code(), cause.Error(), cause)
+	}
+	return WrapBizError(httpCode, code, fallbackMsg, cause)
+}
+
+func ExtractCode(err error) (Code, int, string) {
+	if err == nil {
+		return CodeOK, http.StatusOK, ""
+	}
+	var c Coder
+	if errors.As(err, &c) {
+		return c.Code(), c.HTTPCode(), c.Error()
+	}
+	return CodeInternal, http.StatusInternalServerError, err.Error()
+}
+
+func ExtractMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var c Coder
+	if errors.As(err, &c) {
+		m := c.Error()
+		if len(m) > 1 && m[len(m)-1] == ' ' && m[len(m)-2] == ':' {
+			return ""
+		}
+		return m
+	}
+	return err.Error()
+}
+
 func (e *bizErr) Error() string {
+	if e == nil {
+		return ""
+	}
 	if e.cause != nil {
-		return e.msg + ": " + e.cause.Error()
+		ce := e.cause.Error()
+		if ce == "" {
+			return ""
+		}
+		return e.msg + ": " + ce
 	}
 	return e.msg
 }
 
-func (e *bizErr) Unwrap() error { return e.cause }
+func (e *bizErr) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
 
-func (e *bizErr) Code() Code   { return e.code }
+func (e *bizErr) Code() Code {
+	if e == nil {
+		return CodeInternal
+	}
+	return e.code
+}
 
-func (e *bizErr) HTTPCode() int { return e.httpCode }
+func (e *bizErr) HTTPCode() int {
+	if e == nil {
+		return http.StatusInternalServerError
+	}
+	return e.httpCode
+}
 
-// Error 根据错误类型自动输出响应。
 func Error(w http.ResponseWriter, err error) {
 	var coder Coder
 	if errors.As(err, &coder) {

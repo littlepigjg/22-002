@@ -2,7 +2,13 @@
 #
 # build_benzhi_docker.sh —— 为本项目构建评测专用镜像。
 #
-# 用法：
+# 用法（位置参数，优先匹配）：
+#   ./build_benzhi_docker.sh <image_name> <tag> <platform>
+#   例如：
+#     ./build_benzhi_docker.sh exam-system latest linux/amd64
+#     ./build_benzhi_docker.sh exam-system latest linux/arm64
+#
+# 用法（命名参数）：
 #   ./build_benzhi_docker.sh
 #   ./build_benzhi_docker.sh --tag my-repo/fu-benzhi:latest
 #   ./build_benzhi_docker.sh --no-cache --proxy cn --load
@@ -11,6 +17,7 @@
 #   --tag, -t        目标镜像标签，默认：firmware-upgrade-benzhi:$(date +%Y%m%d-%H%M)
 #   --file, -f       Dockerfile 路径，默认：./benzhi.Dockerfile
 #   --proxy, -p      使用国内加速：cn 或默认 direct
+#   --platform       目标架构，例如 linux/amd64、linux/arm64（可逗号分隔多平台）
 #   --no-cache       强制不使用构建缓存
 #   --load           buildx build 完成后 load 到本地 docker images
 #   --push           构建完成后 push 镜像（需 docker login）
@@ -33,13 +40,28 @@ NO_CACHE=0
 LOAD=0
 PUSH=0
 SAVE=0
+PLATFORM=""
 
-# ---- 解析参数 -----------------------------------------------------------------
+# ---- 支持位置参数：./build.sh <name> <tag> <platform> -------------------------
+# 例如：./build_benzhi_docker.sh exam-system latest linux/amd64
+if [[ $# -ge 2 ]] && [[ "$1" != -* ]]; then
+  IMAGE_NAME="$1"
+  IMAGE_TAG="$2"
+  TAG="${IMAGE_NAME}:${IMAGE_TAG}"
+  shift 2
+  if [[ $# -ge 1 ]] && [[ "$1" != -* ]]; then
+    PLATFORM="$1"
+    shift
+  fi
+fi
+
+# ---- 解析命名参数 -------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -t|--tag)        TAG="$2";   shift 2 ;;
     -f|--file)       DOCKERFILE="$2"; shift 2 ;;
     -p|--proxy)      PROXY="$2"; shift 2 ;;
+    --platform)      PLATFORM="$2"; shift 2 ;;
     --no-cache)      NO_CACHE=1; shift ;;
     --load)          LOAD=1;     shift ;;
     --push)          PUSH=1;     shift ;;
@@ -54,6 +76,7 @@ done
 echo "[build_benzhi] TAG         = ${TAG}"
 echo "[build_benzhi] DOCKERFILE  = ${DOCKERFILE}"
 echo "[build_benzhi] PROXY       = ${PROXY}"
+echo "[build_benzhi] PLATFORM    = ${PLATFORM:-<auto>}"
 echo "[build_benzhi] NO_CACHE    = ${NO_CACHE}"
 echo "[build_benzhi] LOAD/PUSH/SAVE = ${LOAD}/${PUSH}/${SAVE}"
 
@@ -75,6 +98,16 @@ if [[ ! -f go.mod ]]; then
   exit 6
 fi
 
+# ---- 确保 buildx builder 可用 ------------------------------------------------
+set +e
+CURRENT_BUILDER=$(docker buildx inspect --bootstrap 2>/dev/null | head -1)
+set -e
+if [[ -z "${CURRENT_BUILDER}" ]]; then
+  echo "[build_benzhi] 创建 buildx builder: benzhi-builder"
+  docker buildx create --use --name benzhi-builder --driver docker-container >/dev/null 2>&1 || true
+  docker buildx inspect --bootstrap >/dev/null 2>&1 || true
+fi
+
 # ---- 根据 PROXY 设置 build-arg -----------------------------------------------
 if [[ "${PROXY}" == "cn" ]]; then
   BUILD_PROXY_ARGS=(
@@ -88,6 +121,13 @@ fi
 BUILDX_ARGS=()
 if [[ "${NO_CACHE}" -eq 1 ]]; then
   BUILDX_ARGS+=( --no-cache )
+fi
+if [[ -n "${PLATFORM}" ]]; then
+  BUILDX_ARGS+=( --platform "${PLATFORM}" )
+  # 单平台时默认 --load，多平台时只能 --push
+  if [[ "${PLATFORM}" != *,* ]] && [[ "${LOAD}" -eq 0 ]] && [[ "${PUSH}" -eq 0 ]]; then
+    LOAD=1
+  fi
 fi
 if [[ "${LOAD}" -eq 1 ]]; then
   BUILDX_ARGS+=( --load )
@@ -113,8 +153,11 @@ if command -v docker >/dev/null && [[ "${LOAD}" -eq 1 || "${PUSH}" -ne 1 ]]; the
   set -e
   if [[ -n "${INSPECT_ID}" ]]; then
     SIZE=$(docker inspect -f '{{.Size}}' "${TAG}" 2>/dev/null | awk '{printf "%.1f MiB", $1/1024/1024}')
+    ARCH=$(docker inspect -f '{{.Architecture}}' "${TAG}" 2>/dev/null || echo "unknown")
+    OS=$(docker inspect -f '{{.Os}}' "${TAG}" 2>/dev/null || echo "unknown")
     echo "[build_benzhi] 镜像 ID    = ${INSPECT_ID}"
     echo "[build_benzhi] 镜像大小  = ${SIZE}"
+    echo "[build_benzhi] 镜像架构  = ${OS}/${ARCH}"
   fi
 fi
 
@@ -135,20 +178,16 @@ cat <<EOF
   # 一次性前台启动
   docker run --rm -p 8080:8080 -e SEED_DATA=1 ${TAG}
 
-  # 后台运行 + 挂载数据目录
-  mkdir -p ./data && \
-  docker run -d --name fu-benzhi \
-    -p 8080:8080 \
-    -v "\$PWD/data":/app/data \
-    -e SEED_DATA=1 \
-    -e LOG_LEVEL=debug \
-    --health-cmd="curl -fsS http://127.0.0.1:8080/health/live || exit 1" \
+  # 后台运行 + 挂载源码目录（用于评测时进入容器内 go build/go test）
+  docker rm -f test-verify 2>/dev/null || true
+  docker run -d --name test-verify \\
+    -p 8080:8080 \\
+    -v "\$PWD":/app \\
     ${TAG}
 
   # 健康检查
-  curl http://127.0.0.1:8080/health/live
-  curl http://127.0.0.1:8080/health/ready
-  curl http://127.0.0.1:8080/api/v1/stats/overview
+  curl http://127.0.0.1:8080/health
+  curl http://127.0.0.1:8080/ready
 
 EOF
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"firmware-upgrade/internal/config"
+	"firmware-upgrade/internal/dto"
 	"firmware-upgrade/internal/model"
 	"firmware-upgrade/internal/store"
 	"firmware-upgrade/pkg/idgen"
@@ -43,10 +44,9 @@ func NewTaskService(t store.UpgradeTaskStore, e store.TaskExecStore, d store.Dev
 	return &TaskService{tasks: t, execs: e, devices: d, firmwares: f, models: m, gray: g, history: h, stats: st, cfg: cfg}
 }
 
-// Create 创建升级任务。
 func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) (*model.UpgradeTask, error) {
 	if req == nil {
-		return nil, model.ErrInvalidParam
+		return nil, dto.NormalizeBizError(model.ErrInvalidParam)
 	}
 	if err := validate.Run(
 		validate.Required("model_id", req.ModelID),
@@ -56,53 +56,50 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 		validate.InRange("timeout_seconds", req.TimeoutSeconds, 0, 7*24*3600),
 		validate.InRange("max_retry", req.MaxRetry, 0, 10),
 	); err != nil {
-		return nil, err
+		return nil, dto.NormalizeBizError(err)
 	}
-	// 策略合法性。
 	switch req.Strategy {
 	case model.StrategyGrayRatio, model.StrategyDeviceList, model.StrategyFull, "":
 	default:
-		return nil, model.ErrStrategyInvalid
+		return nil, dto.NormalizeBizError(model.ErrStrategyInvalid)
 	}
 	strategy := req.Strategy
 	if strategy == "" {
 		strategy = model.StrategyFull
 	}
 	if strategy == model.StrategyDeviceList && len(req.DeviceIDs) == 0 {
-		return nil, model.ErrStrategyInvalid
+		return nil, dto.NormalizeBizError(model.ErrStrategyInvalid)
 	}
 	if strategy == model.StrategyGrayRatio && req.GrayRatio <= 0 {
-		return nil, model.ErrStrategyInvalid
+		return nil, dto.NormalizeBizError(model.ErrStrategyInvalid)
 	}
-	// 型号、固件存在性校验。
 	if ok, err := s.models.Exists(ctx, req.ModelID); err != nil {
-		return nil, err
+		return nil, dto.NormalizeBizError(err)
 	} else if !ok {
-		return nil, model.ErrModelNotFound
+		return nil, dto.NormalizeBizError(model.ErrModelNotFound)
 	}
-	// 固件关联：优先 firmware_id，次选 model + target_version。
 	var fw *model.Firmware
 	if req.FirmwareID != "" {
 		f, err := s.firmwares.Get(ctx, req.FirmwareID)
 		if err != nil {
-			return nil, err
+			return nil, dto.NormalizeBizError(err)
 		}
 		fw = f
 		if fw.ModelID != req.ModelID {
-			return nil, errors.New("firmware model mismatch")
+			return nil, dto.NormalizeBizError(errors.New("firmware model mismatch"))
 		}
 		if fw.Version != req.TargetVersion {
-			return nil, errors.New("firmware version mismatch target_version")
+			return nil, dto.NormalizeBizError(errors.New("firmware version mismatch target_version"))
 		}
 	} else {
 		f, err := s.firmwares.FindByModelAndVersion(ctx, req.ModelID, req.TargetVersion)
 		if err != nil {
-			return nil, err
+			return nil, dto.NormalizeBizError(err)
 		}
 		fw = f
 	}
 	if fw.Status != model.FirmwarePublished {
-		return nil, model.ErrFirmwareNotPublished
+		return nil, dto.NormalizeBizError(model.ErrFirmwareNotPublished)
 	}
 	now := timeutil.Now()
 	scheduleAt := now
@@ -146,15 +143,18 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 		t.StartTime = now
 	}
 	if err := s.tasks.Create(ctx, t); err != nil {
-		return nil, err
+		return nil, dto.NormalizeBizError(err)
 	}
-	// 为命中的设备预创建执行记录与历史记录。
 	if status == model.TaskStatusRunning {
 		if err := s.assignInitialExecutions(ctx, t); err != nil {
 			logger.Warn("assign initial executions failed", "task_id", t.ID, "err", err)
 		}
 	}
-	return s.tasks.Get(ctx, t.ID)
+	result, errG := s.tasks.Get(ctx, t.ID)
+	if errG != nil {
+		return nil, dto.RequireNotNil(errG)
+	}
+	return result, nil
 }
 
 // assignInitialExecutions 为任务分配命中设备的执行记录。

@@ -1,4 +1,3 @@
-// Package handler HTTP 请求解析辅助：Body 解析、Query 解析、路径参数解析。
 package handler
 
 import (
@@ -10,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"firmware-upgrade/internal/dto"
 	"firmware-upgrade/internal/model"
 	"firmware-upgrade/pkg/response"
 	"firmware-upgrade/pkg/strutil"
@@ -49,39 +49,41 @@ func ParseJSONBody(w http.ResponseWriter, r *http.Request, out any) bool {
 	return true
 }
 
-// WriteError 将 error 转为 HTTP 响应。
 func WriteError(w http.ResponseWriter, err error) {
 	if err == nil {
 		response.OK(w, nil)
 		return
 	}
+	normalized := dto.NormalizeBizError(err)
+	message := dto.NormalizeMessage(normalized)
 	switch {
 	case errors.Is(err, model.ErrNotFound),
 		errors.Is(err, model.ErrFirmwareNotFound),
 		errors.Is(err, model.ErrDeviceNotFound),
 		errors.Is(err, model.ErrTaskNotFound),
 		errors.Is(err, model.ErrModelNotFound):
-		response.NotFound(w, err.Error())
+		response.NotFound(w, message)
 	case errors.Is(err, model.ErrConflict):
-		response.Conflict(w, err.Error())
+		response.Conflict(w, message)
 	case errors.Is(err, model.ErrInvalidParam):
-		response.BadRequest(w, err.Error())
+		response.BadRequest(w, message)
 	case errors.Is(err, model.ErrUnauthorized):
-		response.Unauthorized(w, err.Error())
+		response.Unauthorized(w, message)
 	case errors.Is(err, model.ErrForbidden):
-		response.Forbidden(w, err.Error())
+		response.Forbidden(w, message)
 	case errors.Is(err, model.ErrFirmwareNotPublished):
-		response.BadRequest(w, err.Error())
+		response.BadRequest(w, message)
 	case errors.Is(err, model.ErrAlreadyRegistered):
-		response.Conflict(w, err.Error())
+		response.Conflict(w, message)
 	case errors.Is(err, model.ErrUploadTooLarge):
-		response.Fail(w, http.StatusRequestEntityTooLarge, response.CodeBadRequest, err.Error())
+		response.Fail(w, http.StatusRequestEntityTooLarge, response.CodeBadRequest, message)
 	case errors.Is(err, model.ErrUploadFileEmpty):
-		response.BadRequest(w, err.Error())
+		response.BadRequest(w, message)
 	case errors.Is(err, model.ErrTaskState), errors.Is(err, model.ErrStrategyInvalid):
-		response.BadRequest(w, err.Error())
+		response.BadRequest(w, message)
 	default:
-		response.Error(w, err)
+		code, httpCode, _ := response.ExtractCode(normalized)
+		response.Fail(w, httpCode, code, message)
 	}
 }
 
