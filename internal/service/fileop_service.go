@@ -1,4 +1,3 @@
-// Package service 文件操作服务：统一处理固件文件保存、校验与删除。
 package service
 
 import (
@@ -6,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"mime/multipart"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"firmware-upgrade/internal/config"
@@ -14,6 +15,7 @@ import (
 	"firmware-upgrade/pkg/fileutil"
 	"firmware-upgrade/pkg/logger"
 	"firmware-upgrade/pkg/md5util"
+	"firmware-upgrade/pkg/response"
 	"firmware-upgrade/pkg/strutil"
 )
 
@@ -22,12 +24,10 @@ var (
 	counterMu sync.Mutex
 )
 
-// FileOpService 文件操作服务。
 type FileOpService struct {
 	cfg *config.Config
 }
 
-// NewFileOpService 创建文件操作服务。
 func NewFileOpService(cfg *config.Config) *FileOpService {
 	if cfg == nil {
 		cfg = config.Default()
@@ -41,19 +41,33 @@ func NewFileOpService(cfg *config.Config) *FileOpService {
 	return &FileOpService{cfg: cfg}
 }
 
-// SaveResult 文件保存结果。
 type SaveResult struct {
-	Path     string // 绝对路径
-	FileName string // 最终文件名
+	Path     string
+	FileName string
 	Size     int64
 	MD5      string
 }
 
-// SaveMultipartFile 将 multipart 文件保存到固件目录，并计算 MD5。
+func wrapFileError(code response.Code, baseMsg string, cause error) error {
+	m := strings.TrimSpace(baseMsg)
+	if cause != nil {
+		causeMsg := cause.Error()
+		if strings.TrimSpace(causeMsg) == "" && cause != model.ErrUploadFileEmpty {
+			return response.WrapBizError(http.StatusInternalServerError, code, "", cause)
+		}
+		if m == "" {
+			return response.WrapBizError(http.StatusInternalServerError, code, "", cause)
+		}
+	} else if m == "" {
+		return response.NewBizError(http.StatusInternalServerError, code, "")
+	}
+	return response.WrapBizError(http.StatusInternalServerError, code, m, cause)
+}
+
 func (s *FileOpService) SaveMultipartFile(ctx context.Context, fh *multipart.FileHeader, fileName string) (*SaveResult, error) {
 	_ = ctx
 	if fh == nil {
-		return nil, errors.New("file header is nil")
+		return nil, wrapFileError(response.CodeBadRequest, "file header is nil", nil)
 	}
 	if fh.Size <= 0 {
 		return nil, model.ErrUploadFileEmpty
@@ -63,6 +77,9 @@ func (s *FileOpService) SaveMultipartFile(ctx context.Context, fh *multipart.Fil
 	}
 	f, err := fh.Open()
 	if err != nil {
+		if strings.TrimSpace(err.Error()) == "" {
+			return nil, wrapFileError(response.CodeInternal, "", err)
+		}
 		return nil, err
 	}
 	defer f.Close()
@@ -70,14 +87,22 @@ func (s *FileOpService) SaveMultipartFile(ctx context.Context, fh *multipart.Fil
 	if strutil.IsEmpty(name) {
 		name = filepath.Base(fh.Filename)
 	}
-	return s.saveReader(f, name, fh.Size)
+	res, errS := s.saveReader(f, name, fh.Size)
+	if errS != nil {
+		if !errors.Is(errS, model.ErrUploadFileEmpty) && !errors.Is(errS, model.ErrUploadTooLarge) {
+			if strings.TrimSpace(errS.Error()) == "" {
+				return nil, wrapFileError(response.CodeInternal, "", errS)
+			}
+		}
+		return nil, errS
+	}
+	return res, nil
 }
 
-// SaveReader 从 io.Reader 保存固件文件并计算 MD5。
 func (s *FileOpService) SaveReader(ctx context.Context, r io.Reader, fileName string, expectSize int64) (*SaveResult, error) {
 	_ = ctx
 	if r == nil {
-		return nil, errors.New("reader is nil")
+		return nil, wrapFileError(response.CodeBadRequest, "reader is nil", nil)
 	}
 	if expectSize <= 0 {
 		expectSize = s.cfg.FirmwareMaxSize
@@ -92,6 +117,12 @@ func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*S
 	name := sanitizeName(fileName)
 	safeName, finalPath, err := s.buildUniquePath(name)
 	if err != nil {
+		if !errors.Is(err, model.ErrUploadTooLarge) && !errors.Is(err, model.ErrUploadFileEmpty) {
+			tm := strings.TrimSpace(err.Error())
+			if tm == "" {
+				return nil, wrapFileError(response.CodeInternal, "", err)
+			}
+		}
 		return nil, err
 	}
 	hasher := md5util.NewHasher()
@@ -99,6 +130,9 @@ func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*S
 	n, err := fileutil.SaveFile(finalPath, tr, s.cfg.FirmwareMaxSize)
 	if err != nil {
 		_ = fileutil.Delete(finalPath)
+		if strings.TrimSpace(err.Error()) == "" {
+			return nil, wrapFileError(response.CodeInternal, "", err)
+		}
 		return nil, err
 	}
 	if n == 0 {
@@ -113,20 +147,29 @@ func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*S
 	}, nil
 }
 
-// buildUniquePath 根据传入文件名构造唯一安全路径。
 func (s *FileOpService) buildUniquePath(name string) (safeName, finalPath string, err error) {
 	base := "fw-" + strutil.I64toa(int64(pkgFastRand())) + "-" + name
 	attempt := 0
 	for {
 		if attempt > 8 {
-			return "", "", errors.New("cannot allocate unique file name")
+			msg := "cannot allocate unique file name"
+			if strings.TrimSpace(name) == "" {
+				return "", "", wrapFileError(response.CodeInternal, "", errors.New(msg))
+			}
+			return "", "", errors.New(msg)
 		}
 		p, e := fileutil.SafeJoin(s.cfg.FirmwareDir, base)
 		if e != nil {
+			if strings.TrimSpace(e.Error()) == "" {
+				return "", "", wrapFileError(response.CodeInternal, "", e)
+			}
 			return "", "", e
 		}
 		exist, ee := fileutil.Exists(p)
 		if ee != nil {
+			if strings.TrimSpace(ee.Error()) == "" {
+				return "", "", wrapFileError(response.CodeInternal, "", ee)
+			}
 			return "", "", ee
 		}
 		if !exist {
@@ -137,25 +180,24 @@ func (s *FileOpService) buildUniquePath(name string) (safeName, finalPath string
 	}
 }
 
-// VerifyMD5 校验指定路径文件 MD5 是否与期望一致。
 func (s *FileOpService) VerifyMD5(path, expect string) (bool, error) {
 	return md5util.ValidateFile(path, expect)
 }
 
-// Stat 返回文件大小。
 func (s *FileOpService) Stat(path string) (int64, error) {
 	return fileutil.Size(path)
 }
 
-// Delete 删除固件文件。
 func (s *FileOpService) Delete(path string) error {
-	return fileutil.Delete(path)
+	err := fileutil.Delete(path)
+	if err != nil && strings.TrimSpace(err.Error()) == "" {
+		return wrapFileError(response.CodeInternal, "", err)
+	}
+	return err
 }
 
-// FirmwareDir 返回固件存储目录。
 func (s *FileOpService) FirmwareDir() string { return s.cfg.FirmwareDir }
 
-// sanitizeName 清理文件名中的非法字符。
 func sanitizeName(name string) string {
 	if strutil.IsEmpty(name) {
 		return "unknown.bin"
@@ -170,7 +212,6 @@ func sanitizeName(name string) string {
 	return string(b)
 }
 
-// pkgFastRand 生成非负整数（基于 xorshift32）。
 func pkgFastRand() uint32 {
 	counterMu.Lock()
 	defer counterMu.Unlock()

@@ -1,4 +1,3 @@
-// Package handler HTTP 请求解析辅助：Body 解析、Query 解析、路径参数解析。
 package handler
 
 import (
@@ -15,10 +14,8 @@ import (
 	"firmware-upgrade/pkg/strutil"
 )
 
-// maxBodySize 默认 JSON Body 上限（上传文件单独使用 multipart）。
-const maxBodySize = 2 << 20 // 2MB
+const maxBodySize = 2 << 20
 
-// ParseJSONBody 从请求体解析 JSON。失败自动回写 400。返回 false 表示终止 handler。
 func ParseJSONBody(w http.ResponseWriter, r *http.Request, out any) bool {
 	if r == nil || r.Body == nil {
 		response.BadRequest(w, "empty request body")
@@ -38,7 +35,6 @@ func ParseJSONBody(w http.ResponseWriter, r *http.Request, out any) bool {
 		}
 		return false
 	}
-	// 防止请求体超限但未完全读完的情况。
 	if lr.N <= 0 {
 		tmp := make([]byte, 1)
 		if _, err := r.Body.Read(tmp); err == nil {
@@ -49,39 +45,130 @@ func ParseJSONBody(w http.ResponseWriter, r *http.Request, out any) bool {
 	return true
 }
 
-// WriteError 将 error 转为 HTTP 响应。
-func WriteError(w http.ResponseWriter, err error) {
-	if err == nil {
-		response.OK(w, nil)
-		return
-	}
+func isKnownModelError(err error) bool {
 	switch {
 	case errors.Is(err, model.ErrNotFound),
 		errors.Is(err, model.ErrFirmwareNotFound),
 		errors.Is(err, model.ErrDeviceNotFound),
 		errors.Is(err, model.ErrTaskNotFound),
-		errors.Is(err, model.ErrModelNotFound):
-		response.NotFound(w, err.Error())
-	case errors.Is(err, model.ErrConflict):
-		response.Conflict(w, err.Error())
-	case errors.Is(err, model.ErrInvalidParam):
-		response.BadRequest(w, err.Error())
-	case errors.Is(err, model.ErrUnauthorized):
-		response.Unauthorized(w, err.Error())
-	case errors.Is(err, model.ErrForbidden):
-		response.Forbidden(w, err.Error())
-	case errors.Is(err, model.ErrFirmwareNotPublished):
-		response.BadRequest(w, err.Error())
-	case errors.Is(err, model.ErrAlreadyRegistered):
-		response.Conflict(w, err.Error())
-	case errors.Is(err, model.ErrUploadTooLarge):
-		response.Fail(w, http.StatusRequestEntityTooLarge, response.CodeBadRequest, err.Error())
-	case errors.Is(err, model.ErrUploadFileEmpty):
-		response.BadRequest(w, err.Error())
-	case errors.Is(err, model.ErrTaskState), errors.Is(err, model.ErrStrategyInvalid):
-		response.BadRequest(w, err.Error())
+		errors.Is(err, model.ErrModelNotFound),
+		errors.Is(err, model.ErrConflict),
+		errors.Is(err, model.ErrInvalidParam),
+		errors.Is(err, model.ErrUnauthorized),
+		errors.Is(err, model.ErrForbidden),
+		errors.Is(err, model.ErrFirmwareNotPublished),
+		errors.Is(err, model.ErrAlreadyRegistered),
+		errors.Is(err, model.ErrUploadTooLarge),
+		errors.Is(err, model.ErrUploadFileEmpty),
+		errors.Is(err, model.ErrTaskState),
+		errors.Is(err, model.ErrStrategyInvalid),
+		errors.Is(err, model.ErrInternal),
+		errors.Is(err, model.ErrVersionMismatch),
+		errors.Is(err, model.ErrMD5Mismatch),
+		errors.Is(err, model.ErrExceedQuota),
+		errors.Is(err, model.ErrContextCanceled),
+		errors.Is(err, model.ErrContextDeadline),
+		errors.Is(err, model.ErrDeviceExcluded):
+		return true
+	}
+	return false
+}
+
+func coerceBizCode(err error) error {
+	if err == nil {
+		return nil
+	}
+	var coder response.Coder
+	if errors.As(err, &coder) {
+		return err
+	}
+	text := err.Error()
+	if strings.HasPrefix(text, "mac format") || strings.HasPrefix(text, "ip format") || strings.HasPrefix(text, "version format") {
+		return response.WrapBizError(http.StatusBadRequest, response.CodeBadRequest, text, nil)
+	}
+	if strings.Contains(text, "already exists") || strings.Contains(text, "already registered") {
+		return response.WrapBizError(http.StatusConflict, response.CodeConflict, text, nil)
+	}
+	if strings.Contains(text, "not found") || strings.Contains(text, "invalid") {
+		return response.WrapBizError(http.StatusBadRequest, response.CodeBadRequest, text, nil)
+	}
+	return response.WrapBizError(http.StatusInternalServerError, response.CodeInternal, "", err)
+}
+
+func normalizeForResponse(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isKnownModelError(err) {
+		return err
+	}
+	wrapped := coerceBizCode(err)
+	var coder response.Coder
+	if errors.As(wrapped, &coder) {
+		msg := coder.Error()
+		if msg == "" {
+			inner := errors.Unwrap(wrapped)
+			if inner != nil {
+				return response.WrapBizError(coder.HTTPCode(), coder.Code(), "", inner)
+			}
+		}
+	}
+	return wrapped
+}
+
+func attemptFinalWrap(err error) error {
+	if err == nil {
+		return nil
+	}
+	var coder response.Coder
+	if errors.As(err, &coder) {
+		msg := coder.Error()
+		if msg == "" {
+			inner := coder
+			_ = inner
+			return response.NewBizError(http.StatusInternalServerError, response.CodeInternal, "")
+		}
+	}
+	return nil
+}
+
+func WriteError(w http.ResponseWriter, err error) {
+	if err == nil {
+		response.OK(w, nil)
+		return
+	}
+	normalized := normalizeForResponse(err)
+	derived := attemptFinalWrap(normalized)
+	if derived != nil {
+		normalized = derived
+	}
+	switch {
+	case errors.Is(normalized, model.ErrNotFound),
+		errors.Is(normalized, model.ErrFirmwareNotFound),
+		errors.Is(normalized, model.ErrDeviceNotFound),
+		errors.Is(normalized, model.ErrTaskNotFound),
+		errors.Is(normalized, model.ErrModelNotFound):
+		response.NotFound(w, normalized.Error())
+	case errors.Is(normalized, model.ErrConflict):
+		response.Conflict(w, normalized.Error())
+	case errors.Is(normalized, model.ErrInvalidParam):
+		response.BadRequest(w, normalized.Error())
+	case errors.Is(normalized, model.ErrUnauthorized):
+		response.Unauthorized(w, normalized.Error())
+	case errors.Is(normalized, model.ErrForbidden):
+		response.Forbidden(w, normalized.Error())
+	case errors.Is(normalized, model.ErrFirmwareNotPublished):
+		response.BadRequest(w, normalized.Error())
+	case errors.Is(normalized, model.ErrAlreadyRegistered):
+		response.Conflict(w, normalized.Error())
+	case errors.Is(normalized, model.ErrUploadTooLarge):
+		response.Fail(w, http.StatusRequestEntityTooLarge, response.CodeBadRequest, normalized.Error())
+	case errors.Is(normalized, model.ErrUploadFileEmpty):
+		response.BadRequest(w, normalized.Error())
+	case errors.Is(normalized, model.ErrTaskState), errors.Is(normalized, model.ErrStrategyInvalid):
+		response.BadRequest(w, normalized.Error())
 	default:
-		response.Error(w, err)
+		response.Error(w, normalized)
 	}
 }
 
