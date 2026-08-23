@@ -13,6 +13,8 @@
 # 1) 构建镜像 -----------------------------------------------------------
 ARG GO_VERSION=1.22
 ARG ALPINE_VERSION=3.20
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 
@@ -25,8 +27,8 @@ ENV GOPROXY=${GOPROXY} \
     GOSUMDB=${GOSUMDB} \
     CGO_ENABLED=${CGO_ENABLED} \
     GO111MODULE=on \
-    GOOS=linux \
-    GOARCH=amd64
+    GOOS=${TARGETOS} \
+    GOARCH=${TARGETARCH}
 
 WORKDIR /src
 
@@ -91,7 +93,7 @@ VOLUME [ "/app/data" ]
 
 # 健康检查（5s 宽限、10s 间隔、3 次失败算不健康）
 HEALTHCHECK --start-period=5s --interval=10s --timeout=3s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/health/live || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 
 STOPSIGNAL SIGTERM
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"firmware-upgrade/internal/config"
 	"firmware-upgrade/internal/model"
@@ -209,7 +210,6 @@ func (h *FirmwareHandler) Download(w http.ResponseWriter, r *http.Request) {
 			fw.FilePath = p
 		}
 	}
-	// 安全检查：必须位于固件目录下。
 	absFWDir, err := filepath.Abs(h.fileOp.FirmwareDir())
 	if err != nil {
 		logger.Error("abs firmware dir failed", "err", err)
@@ -226,7 +226,11 @@ func (h *FirmwareHandler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	absPath, err := filepath.Abs(fw.FilePath)
-	if err != nil || !(absPath == absFWDir || len(absPath) > len(absFWDir) && absPath[:len(absFWDir)+1] == absFWDir+string(filepath.Separator)) {
+	if err != nil {
+		response.Internal(w, err)
+		return
+	}
+	if !isPathAllowed(absPath, absFWDir) {
 		response.Forbidden(w, "firmware path invalid")
 		return
 	}
@@ -254,4 +258,16 @@ func (h *FirmwareHandler) Download(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, f); err != nil {
 		logger.Warn("firmware download copy failed", "fw_id", fw.ID, "err", err)
 	}
+}
+
+// isPathAllowed 检查路径是否在允许的根目录下。
+func isPathAllowed(path, root string) bool {
+	if path == root {
+		return true
+	}
+	sep := string(filepath.Separator)
+	if !strings.HasSuffix(root, sep) {
+		root = root + sep
+	}
+	return strings.HasPrefix(path, root)
 }

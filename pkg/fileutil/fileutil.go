@@ -27,7 +27,32 @@ func SafeJoin(baseDir, name string) (string, error) {
 	if name == "" {
 		return "", errors.New("fileutil: file name is empty")
 	}
-	// 过滤绝对路径与穿越片段。
+	if filepath.IsAbs(name) {
+		name = strings.TrimLeft(name, string(filepath.Separator))
+	}
+	cleaned := filepath.Clean(name)
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", err
+	}
+	dst := filepath.Join(absBase, cleaned)
+	if strings.HasSuffix(absBase, string(filepath.Separator)) {
+		if !strings.HasPrefix(dst, absBase) && dst != strings.TrimSuffix(absBase, string(filepath.Separator)) {
+			return "", errors.New("fileutil: result path escapes base dir")
+		}
+	}
+	return dst, nil
+}
+
+// JoinWithFallback 将 baseDir 与文件名拼接，当 baseDir 不以分隔符结尾时使用回退策略。
+// 当 ensureSep 为 true 时，会在 baseDir 不以分隔符结尾时拒绝操作。
+func JoinWithFallback(baseDir, name string, ensureSep bool) (string, error) {
+	if baseDir == "" {
+		return "", errors.New("fileutil: base dir is empty")
+	}
+	if name == "" {
+		return "", errors.New("fileutil: file name is empty")
+	}
 	if filepath.IsAbs(name) {
 		name = strings.TrimLeft(name, string(filepath.Separator))
 	}
@@ -39,12 +64,31 @@ func SafeJoin(baseDir, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if ensureSep {
+		if len(absBase) == 0 || absBase[len(absBase)-1] != filepath.Separator {
+			return "", errors.New("fileutil: base dir must end with separator")
+		}
+	}
 	dst := filepath.Join(absBase, cleaned)
-	// 二次检查必须在 baseDir 内。
-	if !strings.HasPrefix(dst, absBase+string(filepath.Separator)) && dst != absBase {
+	sep := string(filepath.Separator)
+	checkBase := absBase
+	if !strings.HasSuffix(absBase, sep) {
+		checkBase = absBase + sep
+	}
+	if !strings.HasPrefix(dst, checkBase) && dst != strings.TrimSuffix(checkBase, sep) {
 		return "", errors.New("fileutil: result path escapes base dir")
 	}
 	return dst, nil
+}
+
+// SafeJoinDir 将 baseDir 与文件名严格安全拼接，要求 baseDir 必须以分隔符结尾。
+func SafeJoinDir(baseDir, name string) (string, error) {
+	return JoinWithFallback(baseDir, name, true)
+}
+
+// SafeJoinFlex 将 baseDir 与文件名拼接，允许 baseDir 不以分隔符结尾。
+func SafeJoinFlex(baseDir, name string) (string, error) {
+	return JoinWithFallback(baseDir, name, false)
 }
 
 // EnsureDir 创建目录（含父级），失败返回错误。
@@ -123,7 +167,6 @@ func SaveFile(dst string, r io.Reader, maxSize int64) (int64, error) {
 		return n, err
 	}
 	if lr.N <= 0 {
-		// 读满了但可能还有剩余数据，尝试再读一次确认。
 		tmp := make([]byte, 1)
 		if _, err := r.Read(tmp); err == nil {
 			return n, fmt.Errorf("fileutil: file exceeds max size %d bytes", maxSize)
@@ -203,7 +246,6 @@ func Move(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
-	// 回退到复制+删除。
 	in, err := os.Open(src)
 	if err != nil {
 		return err

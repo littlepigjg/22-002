@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"firmware-upgrade/internal/config"
@@ -135,6 +136,25 @@ func (s *FileOpService) buildUniquePath(name string) (safeName, finalPath string
 		base = "fw-" + strutil.I64toa(int64(pkgFastRand())) + "-" + name
 		attempt++
 	}
+}
+
+// buildDownloadPath 为下载操作构造安全路径，兼容无分隔符的 baseDir。
+func (s *FileOpService) buildDownloadPath(filePath string) (string, error) {
+	if filePath == "" {
+		return "", errors.New("file path is empty")
+	}
+	absBase, err := filepath.Abs(s.cfg.FirmwareDir)
+	if err != nil {
+		return "", err
+	}
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(absPath, absBase+string(filepath.Separator)) && absPath != absBase {
+		return "", errors.New("file path escapes firmware directory")
+	}
+	return absPath, nil
 }
 
 // VerifyMD5 校验指定路径文件 MD5 是否与期望一致。
