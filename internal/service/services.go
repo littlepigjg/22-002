@@ -1,4 +1,3 @@
-// Package service 业务逻辑层：装配 service 容器并提供服务。
 package service
 
 import (
@@ -6,7 +5,6 @@ import (
 	"firmware-upgrade/internal/store"
 )
 
-// Services 全部业务服务容器。
 type Services struct {
 	Cfg        *config.Config
 	Stores     *store.Container
@@ -22,20 +20,28 @@ type Services struct {
 	FileOp     *FileOpService
 }
 
-// NewServices 根据配置与存储容器构建全部服务。
 func NewServices(cfg *config.Config, s *store.Container) *Services {
-	if cfg == nil {
-		cfg = config.Default()
-	}
 	if s == nil {
 		s = store.NewContainer()
 	}
 	svc := &Services{
-		Cfg:     cfg,
-		Stores:  s,
-		Model:   NewModelService(s.Models),
-		Device:  NewDeviceService(s.Devices, s.Models),
+		Cfg:    cfg,
+		Stores: s,
 	}
+	if cfg == nil {
+		svc.Model = NewModelService(s.Models)
+		svc.Device = NewDeviceService(s.Devices, s.Models)
+		svc.FileOp = NewFileOpService(nil)
+		svc.Firmware = NewFirmwareService(s.Firmwares, s.Models, svc.FileOp, nil)
+		svc.History = NewHistoryService(s.Histories)
+		svc.Gray = NewGrayService(s.Devices, nil)
+		svc.Task = NewTaskService(s.Tasks, s.Execs, s.Devices, s.Firmwares, s.Models, svc.Gray, svc.History, nil, nil)
+		svc.Progress = NewProgressService(s.Execs, s.Tasks, s.Devices, s.Histories, nil, nil)
+		svc.Poll = NewPollService(s.Tasks, s.Execs, s.Devices, s.Firmwares, svc.Gray, svc.Progress, svc.History, nil)
+		return svc
+	}
+	svc.Model = NewModelService(s.Models)
+	svc.Device = NewDeviceService(s.Devices, s.Models)
 	svc.FileOp = NewFileOpService(cfg)
 	svc.Firmware = NewFirmwareService(s.Firmwares, s.Models, svc.FileOp, cfg)
 	svc.History = NewHistoryService(s.Histories)

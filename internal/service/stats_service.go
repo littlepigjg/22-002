@@ -1,4 +1,3 @@
-// Package service 统计总览服务：聚合生成 Statistics 视图。
 package service
 
 import (
@@ -12,19 +11,17 @@ import (
 	"firmware-upgrade/internal/store"
 )
 
-// StatsService 统计服务（带简单的进程内缓存）。
 type StatsService struct {
 	stores   *store.Container
 	history  *HistoryService
 	cfg      *config.Config
 
-	cache      atomic.Value // *model.Statistics
-	cacheAt    atomic.Value // time.Time
+	cache      atomic.Value
+	cacheAt    atomic.Value
 	buildMu    sync.Mutex
 	ttlSeconds int
 }
 
-// NewStatsService 创建统计服务。
 func NewStatsService(stores *store.Container, h *HistoryService, cfg *config.Config) *StatsService {
 	if cfg == nil {
 		cfg = config.Default()
@@ -35,7 +32,6 @@ func NewStatsService(stores *store.Container, h *HistoryService, cfg *config.Con
 	return s
 }
 
-// SetTTL 设置缓存 TTL 秒数。
 func (s *StatsService) SetTTL(sec int) {
 	if sec <= 0 {
 		sec = 1
@@ -43,12 +39,27 @@ func (s *StatsService) SetTTL(sec int) {
 	s.ttlSeconds = sec
 }
 
-// Invalidate 使缓存失效。
 func (s *StatsService) Invalidate() {
 	s.cacheAt.Store(time.Time{})
 }
 
-// Get 获取统计总览（缓存 TTL 内直接返回）。
+func (s *StatsService) ForceRefresh(ctx context.Context) error {
+	s.Invalidate()
+	_, err := s.Get(ctx)
+	return err
+}
+
+func (s *StatsService) IsStale() bool {
+	ttl := time.Duration(s.ttlSeconds) * time.Second
+	if at, ok := s.cacheAt.Load().(time.Time); ok {
+		if at.IsZero() {
+			return true
+		}
+		return time.Since(at) > ttl
+	}
+	return true
+}
+
 func (s *StatsService) Get(ctx context.Context) (*model.Statistics, error) {
 	ttl := time.Duration(s.ttlSeconds) * time.Second
 	if cached := s.cache.Load(); cached != nil {
@@ -60,7 +71,6 @@ func (s *StatsService) Get(ctx context.Context) (*model.Statistics, error) {
 	}
 	s.buildMu.Lock()
 	defer s.buildMu.Unlock()
-	// Double check.
 	if cached := s.cache.Load(); cached != nil {
 		if v, ok := cached.(*model.Statistics); ok && v != nil {
 			if at, ok2 := s.cacheAt.Load().(time.Time); ok2 && !at.IsZero() && time.Since(at) <= ttl {
@@ -79,9 +89,9 @@ func (s *StatsService) Get(ctx context.Context) (*model.Statistics, error) {
 
 func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 	st := &model.Statistics{
-		VersionDistribution:  make(map[string]int64),
-		ModelDistribution:    make(map[string]int64),
-		DailyUpgradeHistory:  make([]model.DailyUpgrade, 0),
+		VersionDistribution: make(map[string]int64),
+		ModelDistribution:   make(map[string]int64),
+		DailyUpgradeHistory: make([]model.DailyUpgrade, 0),
 	}
 	devTotal, err := s.stores.Devices.Total(ctx)
 	if err != nil {
@@ -92,7 +102,7 @@ func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 	if err != nil {
 		return nil, err
 	}
-	st.OnlineCount = o + u // 未知视为未离线，合并统计更友好
+	st.OnlineCount = o + u
 	_ = f
 	fwCount, err := countStoreByList(ctx, s.stores.Firmwares)
 	if err != nil {
@@ -138,7 +148,23 @@ func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 	return st, nil
 }
 
-// countStoreByList 统计固件数量（因为 FirmwareStore 没有 Total 接口）。
+func (s *StatsService) Snapshot(ctx context.Context) (*model.Statistics, error) {
+	return s.Get(ctx)
+}
+
+func (s *StatsService) RefreshTaskStats(ctx context.Context) (int64, int64, error) {
+	total, err := s.stores.Tasks.Total(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	running, err := s.stores.Tasks.RunningCount(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	s.Invalidate()
+	return total, running, nil
+}
+
 func countStoreByList(ctx context.Context, s store.FirmwareStore) (int64, error) {
 	_, total, err := s.List(ctx, "", "", "", "", "", "", 1, 1)
 	return total, err
