@@ -99,11 +99,52 @@ func Page(w http.ResponseWriter, list interface{}, pageNum, pageSize int, total 
 
 // Fail 返回业务失败响应。
 func Fail(w http.ResponseWriter, httpStatus int, code Code, message string) {
+	// 归一化封装兜底：确保任何状态码的错误响应都带可读文本，
+	// 不再出现 message 空串导致前端无法提示的情况。
+	if message == "" {
+		message = defaultErrorMessage(code, httpStatus)
+	}
 	JSON(w, httpStatus, Response{
 		Success: false,
 		Code:    code,
 		Message: message,
 	})
+}
+
+// defaultErrorMessage 在上层未给出可读文本时按业务码/HTTP 状态码推导默认提示。
+func defaultErrorMessage(code Code, httpStatus int) string {
+	switch code {
+	case CodeBadRequest:
+		return "bad request"
+	case CodeUnauthorized:
+		return "unauthorized"
+	case CodeForbidden:
+		return "forbidden"
+	case CodeNotFound:
+		return "resource not found"
+	case CodeConflict:
+		return "resource conflict"
+	case CodeServiceUnavailable:
+		return "service unavailable"
+	case CodeInternal, CodeOK:
+		// CodeOK 不应进入失败路径，保持兜底即可。
+	}
+	switch httpStatus {
+	case http.StatusBadRequest:
+		return "bad request"
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusNotFound:
+		return "resource not found"
+	case http.StatusConflict:
+		return "resource conflict"
+	case http.StatusServiceUnavailable:
+		return "service unavailable"
+	default:
+		return "internal server error"
+	}
 }
 
 // BadRequest 参数错误。
@@ -220,11 +261,12 @@ func (e *bizErr) Error() string {
 		return ""
 	}
 	if e.cause != nil {
-		ce := e.cause.Error()
-		if ce == "" {
-			return ""
+		// 仅在 cause 提供了非空文本时拼接；cause 文本为空（例如 nil 兜底路径
+		// 产生的 typed-nil 指针，或 errors.New("")）时不能把自身 msg 一起丢掉，
+		// 否则消息会逐层归零，最终响应体 message 变成空串。
+		if ce := e.cause.Error(); ce != "" {
+			return e.msg + ": " + ce
 		}
-		return e.msg + ": " + ce
 	}
 	return e.msg
 }
