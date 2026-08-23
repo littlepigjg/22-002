@@ -1,4 +1,3 @@
-// Package cache 提供简单的 TTL 缓存：LRU-ish（基于 map + 定时清理 goroutine）。
 package cache
 
 import (
@@ -6,13 +5,11 @@ import (
 	"time"
 )
 
-// entry 缓存条目。
 type entry[V any] struct {
 	value     V
 	expiresAt time.Time
 }
 
-// Cache TTL 缓存（支持自定义容量与默认 TTL）。
 type Cache[K comparable, V any] struct {
 	mu       sync.RWMutex
 	data     map[K]entry[V]
@@ -20,9 +17,11 @@ type Cache[K comparable, V any] struct {
 	defaultT time.Duration
 	once     sync.Once
 	stopCh   chan struct{}
+	hit      int64
+	miss     int64
+	purged   int64
 }
 
-// Option 缓存选项。
 type Option func(o *options)
 
 type options struct {
@@ -31,22 +30,18 @@ type options struct {
 	autoPurge bool
 }
 
-// WithCapacity 设置容量。
 func WithCapacity(n int) Option {
 	return func(o *options) { o.capacity = n }
 }
 
-// WithDefaultTTL 设置默认 TTL。
 func WithDefaultTTL(d time.Duration) Option {
 	return func(o *options) { o.defaultT = d }
 }
 
-// WithAutoPurge 开启定时清理。
 func WithAutoPurge(flag bool) Option {
 	return func(o *options) { o.autoPurge = flag }
 }
 
-// New 创建缓存。
 func New[K comparable, V any](opts ...Option) *Cache[K, V] {
 	o := &options{capacity: 1024, defaultT: 10 * time.Minute, autoPurge: true}
 	for _, fn := range opts {
@@ -81,7 +76,6 @@ func (c *Cache[K, V]) startPurge() {
 	})
 }
 
-// Close 停止缓存（停止后台清理）。
 func (c *Cache[K, V]) Close() {
 	select {
 	case <-c.stopCh:
@@ -90,74 +84,94 @@ func (c *Cache[K, V]) Close() {
 	}
 }
 
-// Set 设置键值（使用默认 TTL）。
 func (c *Cache[K, V]) Set(key K, value V) {
 	c.SetTTL(key, value, c.defaultT)
 }
 
-// SetTTL 设置键值，附带自定义 TTL。
 func (c *Cache[K, V]) SetTTL(key K, value V, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if ttl <= 0 {
 		ttl = c.defaultT
 	}
-	// 超出容量时先尝试淘汰过期条目，不够再随机删。
-	if len(c.data) >= c.cap {
+	c.mu.RLock()
+	curLen := len(c.data)
+	c.mu.RUnlock()
+	if curLen >= c.cap {
 		c.evictLocked(8)
-		if len(c.data) >= c.cap {
-			for k := range c.data {
-				delete(c.data, k)
-				break
-			}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.data) >= c.cap {
+		for k := range c.data {
+			delete(c.data, k)
+			break
 		}
 	}
 	c.data[key] = entry[V]{value: value, expiresAt: time.Now().Add(ttl)}
 }
 
-// Get 获取键值。返回 value, found。
 func (c *Cache[K, V]) Get(key K) (V, bool) {
 	c.mu.RLock()
 	e, ok := c.data[key]
 	c.mu.RUnlock()
 	if !ok {
+		c.miss++
 		var zero V
 		return zero, false
 	}
-	if !e.expiresAt.IsZero() && time.Now().After(e.expiresAt) {
-		// 惰性删除。
+	snapExpire := e.expiresAt
+	if !snapExpire.IsZero() && time.Now().After(snapExpire) {
 		c.mu.Lock()
 		delete(c.data, key)
+		c.purged++
 		c.mu.Unlock()
+		c.miss++
 		var zero V
 		return zero, false
 	}
+	c.hit++
 	return e.value, true
 }
 
-// Delete 删除键。
 func (c *Cache[K, V]) Delete(key K) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.data, key)
 }
 
-// Len 返回当前条目数（不含过期清理后的实际数）。
 func (c *Cache[K, V]) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.data)
 }
 
-// Purge 清理过期条目。
 func (c *Cache[K, V]) Purge() int {
+	c.mu.RLock()
+	now := time.Now()
+	candidates := make([]K, 0, len(c.data))
+	for k, e := range c.data {
+		if !e.expiresAt.IsZero() && now.After(e.expiresAt) {
+			candidates = append(candidates, k)
+		}
+	}
+	c.mu.RUnlock()
+	count := 0
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.evictLocked(-1)
+	for _, k := range candidates {
+		if e, ok := c.data[k]; ok {
+			if !e.expiresAt.IsZero() && now.After(e.expiresAt) {
+				delete(c.data, k)
+				count++
+			}
+		}
+	}
+	c.purged += int64(count)
+	c.mu.Unlock()
+	return count
 }
 
-// evictLocked 清理过期条目。maxClean 为 -1 清理全部，否则最多清理 maxClean。返回删除数。
 func (c *Cache[K, V]) evictLocked(maxClean int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	now := time.Now()
 	count := 0
 	for k, e := range c.data {
@@ -169,5 +183,20 @@ func (c *Cache[K, V]) evictLocked(maxClean int) int {
 			count++
 		}
 	}
+	c.purged += int64(count)
 	return count
+}
+
+func (c *Cache[K, V]) Snapshot() map[K]V {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[K]V, len(c.data))
+	for k, e := range c.data {
+		out[k] = e.value
+	}
+	return out
+}
+
+func (c *Cache[K, V]) Stats() (hit, miss, purged int64) {
+	return c.hit, c.miss, c.purged
 }

@@ -33,8 +33,23 @@ NO_CACHE=0
 LOAD=0
 PUSH=0
 SAVE=0
+PLATFORM=""
 
 # ---- 解析参数 -----------------------------------------------------------------
+# 快捷位置参数模式：./build_benzhi_docker.sh <IMAGE_NAME> <TAG> <PLATFORM>
+# 例如：./build_benzhi_docker.sh exam-system latest linux/amd64
+if [[ $# -ge 2 ]] && [[ "$1" != -* ]]; then
+  IMAGE_NAME="$1"
+  TAG_VERSION="$2"
+  TAG="${IMAGE_NAME}:${TAG_VERSION}"
+  if [[ $# -ge 3 ]] && [[ "$3" != -* ]]; then
+    PLATFORM="$3"
+  fi
+  # 位置参数模式下默认 --load 到本地，并使用国内代理（若可用）
+  LOAD=1
+  shift $#
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -t|--tag)        TAG="$2";   shift 2 ;;
@@ -44,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --load)          LOAD=1;     shift ;;
     --push)          PUSH=1;     shift ;;
     --save)          SAVE=1;     shift ;;
+    --platform)      PLATFORM="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,30p' "$0"; exit 0 ;;
     *)
@@ -56,6 +72,7 @@ echo "[build_benzhi] DOCKERFILE  = ${DOCKERFILE}"
 echo "[build_benzhi] PROXY       = ${PROXY}"
 echo "[build_benzhi] NO_CACHE    = ${NO_CACHE}"
 echo "[build_benzhi] LOAD/PUSH/SAVE = ${LOAD}/${PUSH}/${SAVE}"
+echo "[build_benzhi] PLATFORM    = ${PLATFORM:-<default>}"
 
 # ---- 前置依赖检查 -------------------------------------------------------------
 if ! command -v docker >/dev/null 2>&1; then
@@ -94,6 +111,9 @@ if [[ "${LOAD}" -eq 1 ]]; then
 fi
 if [[ "${PUSH}" -eq 1 ]]; then
   BUILDX_ARGS+=( --push )
+fi
+if [[ -n "${PLATFORM}" ]]; then
+  BUILDX_ARGS+=( "--platform" "${PLATFORM}" )
 fi
 
 # ---- 构建 --------------------------------------------------------------------
@@ -140,14 +160,15 @@ cat <<EOF
   docker run -d --name fu-benzhi \
     -p 8080:8080 \
     -v "\$PWD/data":/app/data \
+    -v "\$PWD":/app \
     -e SEED_DATA=1 \
     -e LOG_LEVEL=debug \
-    --health-cmd="curl -fsS http://127.0.0.1:8080/health/live || exit 1" \
+    --health-cmd="curl -fsS http://127.0.0.1:8080/health || exit 1" \
     ${TAG}
 
   # 健康检查
-  curl http://127.0.0.1:8080/health/live
-  curl http://127.0.0.1:8080/health/ready
+  curl http://127.0.0.1:8080/health
+  curl http://127.0.0.1:8080/ready
   curl http://127.0.0.1:8080/api/v1/stats/overview
 
 EOF

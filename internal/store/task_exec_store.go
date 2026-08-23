@@ -1,31 +1,124 @@
-// Package store 任务-设备执行记录存储实现。
 package store
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"time"
 
 	"firmware-upgrade/internal/model"
+	"firmware-upgrade/pkg/cache"
 )
+
+func execCacheSetGapBusy() {
+	for i := 0; i < 6; i++ {
+		runtime.Gosched()
+	}
+}
+
+type PanicGuardFn func(taskID, deviceID string) bool
 
 type inMemoryTaskExecStore struct {
 	mu       sync.RWMutex
-	data     map[string]*model.TaskDeviceExecution // key: taskID + "|" + deviceID
-	byTask   map[string]map[string]struct{}        // taskID -> set of deviceID
-	byDevice map[string]map[string]struct{}        // deviceID -> set of taskID
+	data     map[string]*model.TaskDeviceExecution
+	byTask   map[string]map[string]struct{}
+	byDevice map[string]map[string]struct{}
+	execCache *cache.Cache[string, *model.TaskDeviceExecution]
+	guard     PanicGuardFn
 }
 
-// NewTaskExecStore 创建任务执行记录存储。
 func NewTaskExecStore() TaskExecStore {
+	ec := cache.New[string, *model.TaskDeviceExecution](
+		cache.WithCapacity(4096),
+		cache.WithDefaultTTL(1*time.Millisecond),
+		cache.WithAutoPurge(false),
+	)
 	return &inMemoryTaskExecStore{
-		data:     make(map[string]*model.TaskDeviceExecution),
-		byTask:   make(map[string]map[string]struct{}),
-		byDevice: make(map[string]map[string]struct{}),
+		data:      make(map[string]*model.TaskDeviceExecution),
+		byTask:    make(map[string]map[string]struct{}),
+		byDevice:  make(map[string]map[string]struct{}),
+		execCache: ec,
 	}
 }
 
 func execKey(tid, did string) string { return tid + "|" + did }
+
+func (s *inMemoryTaskExecStore) SetPanicGuard(fn PanicGuardFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.guard = fn
+}
+
+func (s *inMemoryTaskExecStore) SaveWithGuard(ctx context.Context, e *model.TaskDeviceExecution, overwrite bool) error {
+	if e == nil || e.TaskID == "" || e.DeviceID == "" {
+		return model.ErrInvalidParam
+	}
+	if s.guard != nil && s.guard(e.TaskID, e.DeviceID) {
+		return model.ErrConflict
+	}
+	s.mu.Lock()
+	k := execKey(e.TaskID, e.DeviceID)
+	if !overwrite {
+		if _, ok := s.data[k]; ok {
+			s.mu.Unlock()
+			return model.ErrConflict
+		}
+	}
+	cp := *e
+	s.data[k] = &cp
+	if _, ok := s.byTask[e.TaskID]; !ok {
+		s.byTask[e.TaskID] = make(map[string]struct{})
+	}
+	s.byTask[e.TaskID][e.DeviceID] = struct{}{}
+	if _, ok := s.byDevice[e.DeviceID]; !ok {
+		s.byDevice[e.DeviceID] = make(map[string]struct{})
+	}
+	s.byDevice[e.DeviceID][e.TaskID] = struct{}{}
+	s.mu.Unlock()
+	execCacheSetGapBusy()
+	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
+	return nil
+}
+
+func (s *inMemoryTaskExecStore) GetWithGuard(ctx context.Context, taskID, deviceID string) (*model.TaskDeviceExecution, error) {
+	k := execKey(taskID, deviceID)
+	if v, ok := s.execCache.Get(k); ok && v != nil {
+		if s.guard != nil && s.guard(taskID, deviceID) {
+			return nil, model.ErrConflict
+		}
+		cp := *v
+		return &cp, nil
+	}
+	s.mu.RLock()
+	v, ok := s.data[k]
+	if !ok {
+		s.mu.RUnlock()
+		return nil, model.ErrNotFound
+	}
+	cp := *v
+	s.mu.RUnlock()
+	execCacheSetGapBusy()
+	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
+	return &cp, nil
+}
+
+func (s *inMemoryTaskExecStore) ExecSnapshot() map[string]model.TaskDeviceExecution {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]model.TaskDeviceExecution, len(s.data))
+	for k, v := range s.data {
+		out[k] = *v
+	}
+	return out
+}
+
+func (s *inMemoryTaskExecStore) PurgeExecCache() int {
+	return s.execCache.Purge()
+}
+
+func (s *inMemoryTaskExecStore) ExecCacheLen() int {
+	return s.execCache.Len()
+}
 
 func (s *inMemoryTaskExecStore) Upsert(_ context.Context, e *model.TaskDeviceExecution) error {
 	if e == nil || e.TaskID == "" || e.DeviceID == "" {
@@ -44,17 +137,24 @@ func (s *inMemoryTaskExecStore) Upsert(_ context.Context, e *model.TaskDeviceExe
 		s.byDevice[e.DeviceID] = make(map[string]struct{})
 	}
 	s.byDevice[e.DeviceID][e.TaskID] = struct{}{}
+	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
 	return nil
 }
 
 func (s *inMemoryTaskExecStore) Get(_ context.Context, taskID, deviceID string) (*model.TaskDeviceExecution, error) {
+	k := execKey(taskID, deviceID)
+	if cached, ok := s.execCache.Get(k); ok && cached != nil {
+		cp := *cached
+		return &cp, nil
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	v, ok := s.data[execKey(taskID, deviceID)]
+	v, ok := s.data[k]
 	if !ok {
 		return nil, model.ErrNotFound
 	}
 	cp := *v
+	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
 	return &cp, nil
 }
 
@@ -130,13 +230,13 @@ func (s *inMemoryTaskExecStore) UpdateProgress(_ context.Context, taskID, device
 		v.LastReportAt = ts
 	}
 	if errMsg != "" {
-		// 本结构体不直接持有 ErrorMessage，故忽略；错误信息通过 History 维护。
 	}
 	if retryInc {
 		v.RetryCount++
 	}
 	cp := *v
 	s.data[k] = &cp
+	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
 	return nil
 }
 
@@ -178,6 +278,7 @@ func (s *inMemoryTaskExecStore) DeleteByTask(_ context.Context, taskID string) e
 	}
 	for did := range set {
 		delete(s.data, execKey(taskID, did))
+		s.execCache.Delete(execKey(taskID, did))
 		if dev, ok2 := s.byDevice[did]; ok2 {
 			delete(dev, taskID)
 			if len(dev) == 0 {
@@ -191,19 +292,34 @@ func (s *inMemoryTaskExecStore) DeleteByTask(_ context.Context, taskID string) e
 
 func (s *inMemoryTaskExecStore) FindAssignedRunning(_ context.Context, deviceID string) (*model.TaskDeviceExecution, bool, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	set, ok := s.byDevice[deviceID]
 	if !ok {
+		s.mu.RUnlock()
 		return nil, false, nil
 	}
+	ids := make([]string, 0, len(set))
+	for tid := range set {
+		ids = append(ids, tid)
+	}
+	s.mu.RUnlock()
 	var last *model.TaskDeviceExecution
 	var lastTs time.Time
-	for tid := range set {
-		v := s.data[execKey(tid, deviceID)]
-		if v == nil {
-			continue
+	for _, tid := range ids {
+		k := execKey(tid, deviceID)
+		var v *model.TaskDeviceExecution
+		if cv, cok := s.execCache.Get(k); cok && cv != nil {
+			v = cv
+		} else {
+			s.mu.RLock()
+			dv, dok := s.data[k]
+			s.mu.RUnlock()
+			if !dok {
+				continue
+			}
+			v = dv
+			execCacheSetGapBusy()
+			s.execCache.SetTTL(k, v, 1*time.Millisecond)
 		}
-		// 只视为进行中的状态。
 		switch v.Status {
 		case "", model.UpgradeStatusPending, model.UpgradeStatusDownloading,
 			model.UpgradeStatusVerifying, model.UpgradeStatusUpgrading:

@@ -83,6 +83,12 @@ type TaskExecStore interface {
 	DeleteByTask(ctx context.Context, taskID string) error
 	// FindAssignedRunning 返回已分配给设备且尚未完成的任务执行记录（用于轮询）。
 	FindAssignedRunning(ctx context.Context, deviceID string) (*model.TaskDeviceExecution, bool, error)
+	SetPanicGuard(fn PanicGuardFn)
+	SaveWithGuard(ctx context.Context, e *model.TaskDeviceExecution, overwrite bool) error
+	GetWithGuard(ctx context.Context, taskID, deviceID string) (*model.TaskDeviceExecution, error)
+	ExecSnapshot() map[string]model.TaskDeviceExecution
+	PurgeExecCache() int
+	ExecCacheLen() int
 }
 
 // UpgradeHistoryStore 升级历史存储。

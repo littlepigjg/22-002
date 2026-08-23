@@ -1,69 +1,91 @@
-# syntax=docker/dockerfile:1.6
+# benzhi.Dockerfile —— 两阶段构建，BUILDPLATFORM 原生编译 + TARGETPLATFORM 运行层。
 #
-# benzhi.Dockerfile —— 本 Zhi 评测专用多阶段构建镜像（纯 Go，不暴露任何第三方依赖）。
+# 关键加速点（跨架构构建时）：
+#   * builder 阶段使用 --platform=$BUILDPLATFORM，始终在宿主机原生架构
+#     （如 x86_64）上运行，快速交叉编译出目标架构的 server 二进制。
+#   * runner 阶段基于目标架构（linux/arm64 / amd64），仅做轻量 apk 安装，
+#     不跑 Go 大编译，避免 QEMU 下长达数十分钟的卡顿。
 #
-#   阶段：
-#     1. builder —— 拉取 Go 1.22 基础镜像，构建静态二进制。
-#     2. runner  —— 基于 slim + ca-certificates/tzdata 运行。
+# 最终镜像保留 Go 工具链，支持在容器内执行：
+#     go build ./...
+#     go vet ./...
+#     go test -race . -run '^TestRedGreen$'
 #
-#   产物路径：/app/server、/app/web、/app/data
-#   对外端口：EXPOSE 8080
-#   健康检查：/health/live + /health/ready
+# 服务二进制位于 /usr/local/bin/server，不会被 -v $PWD:/app 挂载覆盖。
+#
+# 对外端口：EXPOSE 8080
+# 健康检查：GET /health
+# 工作目录：/app（挂载宿主源码即可验证）
 
-# 1) 构建镜像 -----------------------------------------------------------
 ARG GO_VERSION=1.22
 ARG ALPINE_VERSION=3.20
 
-FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
+# =================== builder：原生架构交叉编译（$BUILDPLATFORM） ===================
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 
-# 评测环境在国内时，可通过 --build-arg GOPROXY=https://goproxy.cn,direct 切换
-ARG GOPROXY=https://proxy.golang.org,direct
-ARG GOSUMDB=sum.golang.org
-ARG CGO_ENABLED=0
+# 评测 / 国内加速
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=sum.golang.google.cn
+ARG APK_MIRROR=mirrors.aliyun.com
+
+# 切换 APK 国内镜像
+RUN if [ -n "${APK_MIRROR}" ]; then \
+      sed -i "s/dl-cdn.alpinelinux.org/${APK_MIRROR}/g" /etc/apk/repositories; \
+    fi
+
+# 目标平台参数（buildx 自动注入）
+ARG TARGETOS
+ARG TARGETARCH
 
 ENV GOPROXY=${GOPROXY} \
     GOSUMDB=${GOSUMDB} \
-    CGO_ENABLED=${CGO_ENABLED} \
     GO111MODULE=on \
-    GOOS=linux \
-    GOARCH=amd64
+    CGO_ENABLED=0
 
 WORKDIR /src
-
-# 依赖层缓存：先拷贝 go.mod / go.sum 再下载
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download && go mod verify
+RUN go mod download 2>&1 || true
 
-# 拷贝全部源码
 COPY . .
+RUN mkdir -p /out \
+    && GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} CGO_ENABLED=0 \
+       go build \
+        -trimpath \
+        -ldflags="-s -w -X 'main.buildVersion=docker-benzhi' -X 'main.buildCommit=local' -X 'main.buildTime=$(date -u +%FT%TZ)'" \
+        -o /out/server \
+        ./cmd/server \
+    && echo "built server for GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64}: $(ls -l /out/server)"
 
-# 构建：关闭 CGO、移除调试符号，输出 /out/server
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
-    mkdir -p /out && \
-    go build \
-      -trimpath \
-      -ldflags="-s -w -X 'main.buildVersion=docker-benzhi' -X 'main.buildCommit=local' -X 'main.buildTime=$(date -u +%FT%TZ)'" \
-      -o /out/server \
-      ./cmd/server && \
-    echo "built: $(ls -l /out/server)"
+# =================== runner：目标架构运行层（保留 Go 工具链） =====================
+FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS runner
 
-# 2) 运行镜像 -----------------------------------------------------------
-FROM alpine:${ALPINE_VERSION} AS runner
+ARG APK_MIRROR=mirrors.aliyun.com
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=sum.golang.google.cn
 
-ARG APP_UID=10001
-ARG APP_GID=10001
+# 切换 APK 国内镜像
+RUN if [ -n "${APK_MIRROR}" ]; then \
+      sed -i "s/dl-cdn.alpinelinux.org/${APK_MIRROR}/g" /etc/apk/repositories; \
+    fi
 
-# 运行时最小依赖：CA、时区、用户创建
-RUN apk add --no-cache ca-certificates tzdata curl \
-    && addgroup -g ${APP_GID} -S appgroup \
-    && adduser  -u ${APP_UID} -S appuser -G appgroup -h /app -s /sbin/nologin \
-    && mkdir -p /app/data/firmwares /app/data/uploads /app/web \
-    && chown -R ${APP_UID}:${APP_GID} /app \
+# 依赖说明：
+#   gcc + musl-dev —— go test -race 需要 CGO；
+#   curl            —— 健康检查 HTTP 探测；
+#   bash            —— docker exec /bin/bash 验收脚本；
+#   tzdata          —— 时区数据库。
+RUN apk add --no-cache \
+        curl \
+        bash \
+        tzdata \
+        gcc \
+        musl-dev \
     && rm -rf /var/cache/apk/* /tmp/*
 
-ENV TZ=Asia/Shanghai \
+ENV GOPROXY=${GOPROXY} \
+    GOSUMDB=${GOSUMDB} \
+    CGO_ENABLED=1 \
+    GO111MODULE=on \
+    TZ=Asia/Shanghai \
     LANG=C.UTF-8 \
     APP_ENV=production \
     APP_PORT=8080 \
@@ -76,25 +98,22 @@ ENV TZ=Asia/Shanghai \
 
 WORKDIR /app
 
-# 二进制
-COPY --from=builder /out/server /app/server
+# server 二进制（来自 builder 交叉编译）
+COPY --from=builder /out/server /usr/local/bin/server
+RUN chmod +x /usr/local/bin/server
 
-# 前端静态资源目录（若构建时已内嵌 go:embed 则无需复制；这里也保留显式目录兜底）
+# 数据目录与静态资源
+RUN mkdir -p /app/data/firmwares /app/data/uploads /app/web
 COPY web /app/web
 
-# 运行用户与暴露端口
-USER ${APP_UID}:${APP_GID}
 EXPOSE 8080/tcp
-
-# 持久化数据目录
 VOLUME [ "/app/data" ]
 
-# 健康检查（5s 宽限、10s 间隔、3 次失败算不健康）
+# 健康检查
 HEALTHCHECK --start-period=5s --interval=10s --timeout=3s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/health/live || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 
 STOPSIGNAL SIGTERM
 
-# 启动入口（shell 形式可让 shell 展开环境变量）
-ENTRYPOINT [ "/app/server" ]
+ENTRYPOINT [ "/usr/local/bin/server" ]
 CMD []
