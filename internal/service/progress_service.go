@@ -167,48 +167,53 @@ func (p *ProgressService) ScanTimeout(ctx context.Context) int {
 
 // UpdateHistoryOnProgress 在进度更新时同步历史记录。
 func (p *ProgressService) UpdateHistoryOnProgress(ctx context.Context, taskID, deviceID string, status model.UpgradeStatus, progress int, errMsg string, downloadSpeed int64, md5Verified bool, retryInc bool, now time.Time) {
+	// FindLatestByDevice 在无历史记录时返回 (nil, nil)，需判空，避免 nil 解引用。
 	h, err := p.histories.FindLatestByDevice(ctx, deviceID, taskID)
-	if err == nil {
-		h.Status = status
-		h.Progress = progress
-		if errMsg != "" {
-			h.ErrorMessage = errMsg
+	if err != nil || h == nil {
+		return
+	}
+	h.Status = status
+	h.Progress = progress
+	if errMsg != "" {
+		h.ErrorMessage = errMsg
+	}
+	if downloadSpeed > 0 {
+		h.DownloadSpeed = downloadSpeed
+	}
+	h.MD5Verified = md5Verified
+	if retryInc {
+		h.RetryCount++
+	}
+	if status == model.UpgradeStatusSuccess || status == model.UpgradeStatusFailed ||
+		status == model.UpgradeStatusCanceled {
+		h.FinishedAt = now
+		if !h.StartedAt.IsZero() {
+			h.DurationMs = now.Sub(h.StartedAt).Milliseconds()
 		}
-		if downloadSpeed > 0 {
-			h.DownloadSpeed = downloadSpeed
+		if status == model.UpgradeStatusSuccess {
+			_ = p.devices.UpdateVersion(ctx, deviceID, "")
 		}
-		h.MD5Verified = md5Verified
-		if retryInc {
-			h.RetryCount++
-		}
-		if status == model.UpgradeStatusSuccess || status == model.UpgradeStatusFailed ||
-			status == model.UpgradeStatusCanceled {
-			h.FinishedAt = now
-			if !h.StartedAt.IsZero() {
-				h.DurationMs = now.Sub(h.StartedAt).Milliseconds()
-			}
-			if status == model.UpgradeStatusSuccess {
-				_ = p.devices.UpdateVersion(ctx, deviceID, "")
-			}
-		}
-		if errU := p.histories.Update(ctx, h); errU != nil {
-			logger.Warn("update history failed", "task_id", taskID, "device_id", deviceID, "err", errU)
-		}
+	}
+	if errU := p.histories.Update(ctx, h); errU != nil {
+		logger.Warn("update history failed", "task_id", taskID, "device_id", deviceID, "err", errU)
 	}
 }
 
 // MarkHistoryTimeout 将指定设备的历史记录标记为超时失败。
 func (p *ProgressService) MarkHistoryTimeout(ctx context.Context, taskID, deviceID string, now time.Time) {
+	// 设备可能已被分配执行记录但尚无历史记录（如历史创建失败或被上报前触发超时扫描），
+	// FindLatestByDevice 此时返回 (nil, nil)，需显式判空，避免 nil 解引用 panic。
 	h, err := p.histories.FindLatestByDevice(ctx, deviceID, taskID)
-	if err == nil {
-		h.Status = model.UpgradeStatusFailed
-		h.ErrorMessage = "timeout: no progress report"
-		h.FinishedAt = now
-		if !h.StartedAt.IsZero() {
-			h.DurationMs = now.Sub(h.StartedAt).Milliseconds()
-		}
-		_ = p.histories.Update(ctx, h)
+	if err != nil || h == nil {
+		return
 	}
+	h.Status = model.UpgradeStatusFailed
+	h.ErrorMessage = "timeout: no progress report"
+	h.FinishedAt = now
+	if !h.StartedAt.IsZero() {
+		h.DurationMs = now.Sub(h.StartedAt).Milliseconds()
+	}
+	_ = p.histories.Update(ctx, h)
 }
 
 // 添加一行确保 time 包使用。

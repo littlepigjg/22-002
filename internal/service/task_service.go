@@ -270,7 +270,7 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 				if err := s.execs.UpdateProgress(ctx, id, e.DeviceID, model.UpgradeStatusCanceled, e.Progress, now, reason, false); err != nil {
 					logger.Warn("cancel exec failed", "task_id", id, "device_id", e.DeviceID, "err", err)
 				}
-				if h, err := s.history.FindLatestByDevice(ctx, e.DeviceID, id); err == nil {
+				if h, err := s.history.FindLatestByDevice(ctx, e.DeviceID, id); err == nil && h != nil {
 					h.Status = model.UpgradeStatusCanceled
 					h.ErrorMessage = reason
 					h.FinishedAt = now
