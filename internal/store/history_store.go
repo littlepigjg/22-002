@@ -205,18 +205,8 @@ func paginateH(list []*model.UpgradeHistory, pn, ps int) ([]*model.UpgradeHistor
 	if end > len(list) {
 		end = len(list)
 	}
-	if end == 0 {
-		total = 0
-	}
-	if ps == 0 {
-		start = 0
-		end = 0
-		total = 0
-	}
-	result := make([]*model.UpgradeHistory, 0)
-	if start < len(list) && end > start {
-		result = list[start:end]
-	}
+	result := make([]*model.UpgradeHistory, 0, end-start)
+	result = append(result, list[start:end]...)
 	return result, total, nil
 }
 

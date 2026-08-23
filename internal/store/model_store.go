@@ -272,17 +272,7 @@ func paginateDM(list []*model.DeviceModel, pn, ps int) ([]*model.DeviceModel, in
 	if end > len(list) {
 		end = len(list)
 	}
-	if end == 0 {
-		total = 0
-	}
-	if ps == 0 {
-		start = 0
-		end = 0
-		total = 0
-	}
-	result := make([]*model.DeviceModel, 0)
-	if start < len(list) && end > start {
-		result = list[start:end]
-	}
+	result := make([]*model.DeviceModel, 0, end-start)
+	result = append(result, list[start:end]...)
 	return result, total, nil
 }

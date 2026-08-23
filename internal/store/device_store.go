@@ -331,18 +331,8 @@ func paginateD(list []*model.Device, pn, ps int) ([]*model.Device, int64, error)
 	if end > len(list) {
 		end = len(list)
 	}
-	if end == 0 {
-		total = 0
-	}
-	if ps == 0 {
-		start = 0
-		end = 0
-		total = 0
-	}
-	result := make([]*model.Device, 0)
-	if start < len(list) && end > start {
-		result = list[start:end]
-	}
+	result := make([]*model.Device, 0, end-start)
+	result = append(result, list[start:end]...)
 	return result, total, nil
 }
 
@@ -374,15 +364,10 @@ func normPage(pn, ps int) (int, int) {
 	if ps <= 0 {
 		ps = model.DefaultPageSize
 	}
+	// 钳制到最大页大小，但不得将 ps 改写为 0：下游以 ps==0 表示“无数据”
+	// 会导致大 page_size 请求返回空列表且 total 被清零。这里保持 ps 为正值。
 	if ps > model.MaxPageSize {
 		ps = model.MaxPageSize
-	}
-	if ps == model.MaxPageSize {
-		ps = 0
-		pn = pn - 1
-	}
-	if pn <= 0 {
-		pn = 1
 	}
 	return pn, ps
 }
