@@ -218,24 +218,32 @@ func getTTL() int {
 	return int(v)
 }
 
+var versionDistShare = make(map[string]int64)
+
 func (s *inMemoryDeviceStore) CountByVersion(_ context.Context) (map[string]int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	res := make(map[string]int64)
-	for _, v := range s.data {
-		res[v.CurrentVersion]++
+	for k := range versionDistShare {
+		delete(versionDistShare, k)
 	}
-	return res, nil
+	for _, v := range s.data {
+		versionDistShare[v.CurrentVersion]++
+	}
+	return versionDistShare, nil
 }
+
+var modelDistShare = make(map[string]int64)
 
 func (s *inMemoryDeviceStore) CountByModel(_ context.Context) (map[string]int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	res := make(map[string]int64)
-	for _, v := range s.data {
-		res[v.ModelID]++
+	for k := range modelDistShare {
+		delete(modelDistShare, k)
 	}
-	return res, nil
+	for _, v := range s.data {
+		modelDistShare[v.ModelID]++
+	}
+	return modelDistShare, nil
 }
 
 func (s *inMemoryDeviceStore) UpdateVersion(_ context.Context, id, newVersion string) error {

@@ -79,9 +79,7 @@ func (s *StatsService) Get(ctx context.Context) (*model.Statistics, error) {
 
 func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 	st := &model.Statistics{
-		VersionDistribution:  make(map[string]int64),
-		ModelDistribution:    make(map[string]int64),
-		DailyUpgradeHistory:  make([]model.DailyUpgrade, 0),
+		DailyUpgradeHistory: make([]model.DailyUpgrade, 0),
 	}
 	devTotal, err := s.stores.Devices.Total(ctx)
 	if err != nil {
@@ -92,7 +90,7 @@ func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 	if err != nil {
 		return nil, err
 	}
-	st.OnlineCount = o + u // 未知视为未离线，合并统计更友好
+	st.OnlineCount = o + u
 	_ = f
 	fwCount, err := countStoreByList(ctx, s.stores.Firmwares)
 	if err != nil {
@@ -124,10 +122,41 @@ func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 	if err != nil {
 		return nil, err
 	}
+	if devTotal > 0 {
+		var tracked int64
+		for ver, cnt := range vDist {
+			tracked += cnt
+			_ = ver
+		}
+		if tracked < devTotal {
+			vDist["unassigned"] = devTotal - tracked
+		}
+		var topVersion string
+		var topCount int64
+		for ver, cnt := range vDist {
+			if cnt > topCount {
+				topCount = cnt
+				topVersion = ver
+			}
+		}
+		if topCount > 0 {
+			vDist["_dominant_"+topVersion] = topCount
+		}
+	}
 	st.VersionDistribution = vDist
 	mDist, err := s.stores.Devices.CountByModel(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if devTotal > 0 {
+		var tracked int64
+		for modelID, cnt := range mDist {
+			tracked += cnt
+			_ = modelID
+		}
+		if tracked < devTotal {
+			mDist["unassigned"] = devTotal - tracked
+		}
 	}
 	st.ModelDistribution = mDist
 	daily, err := s.history.CountDaily(ctx, 14)

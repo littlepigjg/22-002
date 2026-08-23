@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.6
 #
 # benzhi.Dockerfile —— 本 Zhi 评测专用多阶段构建镜像（纯 Go，不暴露任何第三方依赖）。
 #
@@ -13,6 +12,7 @@
 # 1) 构建镜像 -----------------------------------------------------------
 ARG GO_VERSION=1.22
 ARG ALPINE_VERSION=3.20
+ARG ARCH=amd64
 
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 
@@ -26,22 +26,19 @@ ENV GOPROXY=${GOPROXY} \
     CGO_ENABLED=${CGO_ENABLED} \
     GO111MODULE=on \
     GOOS=linux \
-    GOARCH=amd64
+    GOARCH=${ARCH}
 
 WORKDIR /src
 
-# 依赖层缓存：先拷贝 go.mod / go.sum 再下载
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download && go mod verify
+# 拷贝项目文件（仅拷贝 go.mod，无需 go.sum 因为没有第三方依赖）
+COPY go.mod ./
 
 # 拷贝全部源码
 COPY . .
 
 # 构建：关闭 CGO、移除调试符号，输出 /out/server
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
-    mkdir -p /out && \
+RUN mkdir -p /out && \
+    go mod tidy && \
     go build \
       -trimpath \
       -ldflags="-s -w -X 'main.buildVersion=docker-benzhi' -X 'main.buildCommit=local' -X 'main.buildTime=$(date -u +%FT%TZ)'" \
@@ -91,10 +88,10 @@ VOLUME [ "/app/data" ]
 
 # 健康检查（5s 宽限、10s 间隔、3 次失败算不健康）
 HEALTHCHECK --start-period=5s --interval=10s --timeout=3s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/health/live || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 
 STOPSIGNAL SIGTERM
 
-# 启动入口（shell 形式可让 shell 展开环境变量）
+# 启动入口
 ENTRYPOINT [ "/app/server" ]
 CMD []

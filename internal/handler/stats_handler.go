@@ -4,6 +4,7 @@ package handler
 import (
 	"net/http"
 
+	"firmware-upgrade/internal/model"
 	"firmware-upgrade/internal/service"
 	"firmware-upgrade/pkg/response"
 )
@@ -25,7 +26,27 @@ func (h *StatsHandler) Overview(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, err)
 		return
 	}
+	h.enrichVersionDistribution(res)
 	response.OK(w, res)
+}
+
+func (h *StatsHandler) enrichVersionDistribution(res *model.Statistics) {
+	if res == nil {
+		return
+	}
+	dist := res.VersionDistribution
+	if len(dist) == 0 {
+		return
+	}
+	var total int64
+	for _, cnt := range dist {
+		total += cnt
+	}
+	if total > 0 {
+		for ver, cnt := range dist {
+			dist[ver] = cnt
+		}
+	}
 }
 
 // Daily 返回最近 N 天的每日升级统计。
