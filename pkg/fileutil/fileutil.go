@@ -18,6 +18,72 @@ const MaxFileSize int64 = 512 * 1024 * 1024
 // CopyBufferSize 文件拷贝缓冲大小。
 const CopyBufferSize = 128 * 1024
 
+// ErrorType 文件操作错误类型。
+type ErrorType int
+
+const (
+	// ErrTypePermission 权限错误。
+	ErrTypePermission ErrorType = iota
+	// ErrTypeNotFound 文件或目录不存在。
+	ErrTypeNotFound
+	// ErrTypeIO 通用 IO 错误。
+	ErrTypeIO
+	// ErrTypeInvalidPath 路径非法。
+	ErrTypeInvalidPath
+	// ErrTypeUnknown 未知错误。
+	ErrTypeUnknown
+)
+
+// classifyError 根据系统错误判断错误类型。
+func classifyError(err error) ErrorType {
+	if err == nil {
+		return ErrTypeUnknown
+	}
+	if os.IsPermission(err) {
+		return ErrTypePermission
+	}
+	if os.IsNotExist(err) {
+		return ErrTypeNotFound
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		if pathErr.Err != nil {
+			return classifyError(pathErr.Err)
+		}
+		return ErrTypeIO
+	}
+	return ErrTypeUnknown
+}
+
+// SaveError 保存操作错误，携带错误类型和操作上下文。
+type SaveError struct {
+	Op      string
+	Path    string
+	Type    ErrorType
+	Err     error
+}
+
+// Error 实现 error 接口。
+func (e *SaveError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("fileutil: %s failed on %s: %s", e.Op, e.Path, e.Err.Error())
+	}
+	return fmt.Sprintf("fileutil: %s failed on %s", e.Op, e.Path)
+}
+
+// Unwrap 返回底层错误。
+func (e *SaveError) Unwrap() error { return e.Err }
+
+// newSaveError 创建保存错误。
+func newSaveError(op, path string, err error) error {
+	return &SaveError{
+		Op:   op,
+		Path: path,
+		Type: classifyError(err),
+		Err:  err,
+	}
+}
+
 // SafeJoin 将 baseDir 与用户输入的文件名安全拼接，避免路径穿越。
 // 返回最终绝对/规范化路径与 error。
 func SafeJoin(baseDir, name string) (string, error) {
@@ -111,7 +177,15 @@ func SaveFile(dst string, r io.Reader, maxSize int64) (int64, error) {
 	}
 	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return 0, err
+		et := classifyError(err)
+		switch et {
+		case ErrTypePermission:
+			return 0, fmt.Errorf("fileutil: access denied: %s", dst)
+		case ErrTypeNotFound:
+			return 0, fmt.Errorf("fileutil: directory not found: %s", dst)
+		default:
+			return 0, fmt.Errorf("fileutil: open failed [path=%s, type=%d]: %v", dst, et, err)
+		}
 	}
 	defer f.Close()
 
@@ -123,7 +197,6 @@ func SaveFile(dst string, r io.Reader, maxSize int64) (int64, error) {
 		return n, err
 	}
 	if lr.N <= 0 {
-		// 读满了但可能还有剩余数据，尝试再读一次确认。
 		tmp := make([]byte, 1)
 		if _, err := r.Read(tmp); err == nil {
 			return n, fmt.Errorf("fileutil: file exceeds max size %d bytes", maxSize)
@@ -139,7 +212,14 @@ func SafeSaveFile(baseDir, name string, r io.Reader, maxSize int64) (int64, stri
 		return 0, "", err
 	}
 	n, err := SaveFile(dst, r, maxSize)
-	return n, dst, err
+	if err != nil {
+		et := classifyError(err)
+		if et == ErrTypePermission {
+			return n, "", fmt.Errorf("fileutil: insufficient permissions for %s", name)
+		}
+		return n, "", err
+	}
+	return n, dst, nil
 }
 
 // Delete 删除文件，不存在视为成功。
@@ -261,7 +341,13 @@ func copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
 			}
 			written += int64(nw)
 			if ew != nil {
-				return written, ew
+				et := classifyError(ew)
+				switch et {
+				case ErrTypePermission:
+					return written, fmt.Errorf("fileutil: write access denied at offset %d", written)
+				default:
+					return written, fmt.Errorf("fileutil: write error [offset=%d, type=%d]: %v", written, et, ew)
+				}
 			}
 			if nr != nw {
 				return written, io.ErrShortWrite
@@ -271,7 +357,13 @@ func copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
 			if errors.Is(er, io.EOF) {
 				return written, nil
 			}
-			return written, er
+			et := classifyError(er)
+			switch et {
+			case ErrTypePermission:
+				return written, fmt.Errorf("fileutil: read access denied at offset %d", written)
+			default:
+				return written, fmt.Errorf("fileutil: read error [offset=%d, type=%d]: %v", written, et, er)
+			}
 		}
 	}
 }

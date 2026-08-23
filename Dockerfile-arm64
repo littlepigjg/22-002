@@ -1,0 +1,48 @@
+# 运行镜像 - arm64
+FROM alpine:3.20
+
+ARG APP_UID=10001
+ARG APP_GID=10001
+
+# 运行时最小依赖：CA、时区、用户创建
+RUN apk add --no-cache ca-certificates tzdata curl \
+    && addgroup -g ${APP_GID} -S appgroup \
+    && adduser  -u ${APP_UID} -S appuser -G appgroup -h /app -s /sbin/nologin \
+    && mkdir -p /app/data/firmwares /app/data/uploads /app/web \
+    && chown -R ${APP_UID}:${APP_GID} /app \
+    && rm -rf /var/cache/apk/* /tmp/*
+
+ENV TZ=Asia/Shanghai \
+    LANG=C.UTF-8 \
+    APP_ENV=production \
+    APP_PORT=8080 \
+    APP_ADDR=0.0.0.0:8080 \
+    DATA_DIR=/app/data \
+    FIRMWARE_DIR=/app/data/firmwares \
+    MAX_UPLOAD_MB=100 \
+    SEED_DATA=1 \
+    LOG_LEVEL=info
+
+WORKDIR /app
+
+# 使用预编译的 arm64 二进制
+COPY server-arm64 /app/server
+COPY web /app/web
+
+RUN chmod +x /app/server
+
+# 运行用户与暴露端口
+USER ${APP_UID}:${APP_GID}
+EXPOSE 8080/tcp
+
+# 持久化数据目录
+VOLUME [ "/app/data" ]
+
+# 健康检查
+HEALTHCHECK --start-period=5s --interval=10s --timeout=3s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/health/live || exit 1
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT [ "/app/server" ]
+CMD []

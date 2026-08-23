@@ -4,8 +4,10 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -70,7 +72,20 @@ func (s *FileOpService) SaveMultipartFile(ctx context.Context, fh *multipart.Fil
 	if strutil.IsEmpty(name) {
 		name = filepath.Base(fh.Filename)
 	}
-	return s.saveReader(f, name, fh.Size)
+	result, err := s.saveReader(f, name, fh.Size)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logger.Warn("multipart upload permission denied", "filename", name, "err", err)
+			return nil, model.ErrForbidden
+		}
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			logger.Warn("multipart upload path error", "filename", name, "path", pathErr.Path, "err", err)
+		}
+		return nil, fmt.Errorf("SaveMultipartFile: failed to upload %s: %w", name, err)
+	}
+	logger.Info("multipart file saved", "filename", name, "size", result.Size, "md5", result.MD5)
+	return result, nil
 }
 
 // SaveReader 从 io.Reader 保存固件文件并计算 MD5。
@@ -82,7 +97,16 @@ func (s *FileOpService) SaveReader(ctx context.Context, r io.Reader, fileName st
 	if expectSize <= 0 {
 		expectSize = s.cfg.FirmwareMaxSize
 	}
-	return s.saveReader(r, fileName, expectSize)
+	result, err := s.saveReader(r, fileName, expectSize)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logger.Warn("saveReader permission denied", "filename", fileName, "err", err)
+			return nil, model.ErrForbidden
+		}
+		logger.Error("saveReader failed", "filename", fileName, "size", expectSize, "err", err)
+		return nil, fmt.Errorf("SaveReader: failed to save %s: %w", fileName, err)
+	}
+	return result, nil
 }
 
 func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*SaveResult, error) {
@@ -98,8 +122,17 @@ func (s *FileOpService) saveReader(r io.Reader, fileName string, size int64) (*S
 	tr := io.TeeReader(r, hasher)
 	n, err := fileutil.SaveFile(finalPath, tr, s.cfg.FirmwareMaxSize)
 	if err != nil {
-		_ = fileutil.Delete(finalPath)
-		return nil, err
+		shouldCleanup := true
+		if errors.Is(err, os.ErrPermission) {
+			shouldCleanup = false
+		}
+		if shouldCleanup {
+			_ = fileutil.Delete(finalPath)
+		}
+		if errors.Is(err, os.ErrPermission) {
+			return nil, model.ErrForbidden
+		}
+		return nil, fmt.Errorf("saveReader: failed to write firmware %s: %w", fileName, err)
 	}
 	if n == 0 {
 		_ = fileutil.Delete(finalPath)

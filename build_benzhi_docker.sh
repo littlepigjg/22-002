@@ -3,12 +3,17 @@
 # build_benzhi_docker.sh —— 为本项目构建评测专用镜像。
 #
 # 用法：
-#   ./build_benzhi_docker.sh
+#   ./build_benzhi_docker.sh [IMAGE_NAME] [TAG] [PLATFORM]
+#   ./build_benzhi_docker.sh exam-system latest linux/amd64
 #   ./build_benzhi_docker.sh --tag my-repo/fu-benzhi:latest
 #   ./build_benzhi_docker.sh --no-cache --proxy cn --load
 #
 # 参数：
-#   --tag, -t        目标镜像标签，默认：firmware-upgrade-benzhi:$(date +%Y%m%d-%H%M)
+#   位置参数:         [IMAGE_NAME] [TAG] [PLATFORM]
+#                    IMAGE_NAME: 镜像名称，如 exam-system
+#                    TAG: 镜像标签，如 latest
+#                    PLATFORM: 目标平台架构，如 linux/amd64 或 linux/arm64
+#   --tag, -t        目标镜像标签（覆盖位置参数）
 #   --file, -f       Dockerfile 路径，默认：./benzhi.Dockerfile
 #   --proxy, -p      使用国内加速：cn 或默认 direct
 #   --no-cache       强制不使用构建缓存
@@ -26,7 +31,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 # ---- 默认参数 -----------------------------------------------------------------
-TAG="firmware-upgrade-benzhi:$(date +%Y%m%d-%H%M%S)"
+IMAGE_NAME=""
+TAG_NAME=""
+PLATFORM=""
 DOCKERFILE="./benzhi.Dockerfile"
 PROXY="direct"
 NO_CACHE=0
@@ -35,21 +42,82 @@ PUSH=0
 SAVE=0
 
 # ---- 解析参数 -----------------------------------------------------------------
+POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -t|--tag)        TAG="$2";   shift 2 ;;
-    -f|--file)       DOCKERFILE="$2"; shift 2 ;;
-    -p|--proxy)      PROXY="$2"; shift 2 ;;
-    --no-cache)      NO_CACHE=1; shift ;;
-    --load)          LOAD=1;     shift ;;
-    --push)          PUSH=1;     shift ;;
-    --save)          SAVE=1;     shift ;;
+    -t|--tag)
+      TAG_NAME="$2"
+      shift 2
+      ;;
+    -f|--file)
+      DOCKERFILE="$2"
+      shift 2
+      ;;
+    -p|--proxy)
+      PROXY="$2"
+      shift 2
+      ;;
+    --no-cache)
+      NO_CACHE=1
+      shift
+      ;;
+    --load)
+      LOAD=1
+      shift
+      ;;
+    --push)
+      PUSH=1
+      shift
+      ;;
+    --save)
+      SAVE=1
+      shift
+      ;;
     -h|--help)
-      sed -n '2,30p' "$0"; exit 0 ;;
+      sed -n '2,40p' "$0"
+      exit 0
+      ;;
+    -*)
+      echo "未知参数: $1" >&2
+      exit 2
+      ;;
     *)
-      echo "未知参数: $1" >&2; exit 2 ;;
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
   esac
 done
+
+# 解析位置参数：IMAGE_NAME TAG PLATFORM
+if [[ ${#POSITIONAL_ARGS[@]} -ge 1 ]]; then
+  IMAGE_NAME="${POSITIONAL_ARGS[0]}"
+fi
+if [[ ${#POSITIONAL_ARGS[@]} -ge 2 ]]; then
+  TAG_NAME="${POSITIONAL_ARGS[1]}"
+fi
+if [[ ${#POSITIONAL_ARGS[@]} -ge 3 ]]; then
+  PLATFORM="${POSITIONAL_ARGS[2]}"
+fi
+
+# 若指定了 IMAGE_NAME 和 TAG，则组合为完整 TAG
+if [[ -n "${IMAGE_NAME}" && -n "${TAG_NAME}" ]]; then
+  TAG="${IMAGE_NAME}:${TAG_NAME}"
+elif [[ -n "${IMAGE_NAME}" ]]; then
+  TAG="${IMAGE_NAME}:latest"
+elif [[ -n "${TAG_NAME}" ]]; then
+  TAG="${TAG_NAME}"
+else
+  TAG="firmware-upgrade-benzhi:$(date +%Y%m%d-%H%M%S)"
+fi
+
+# ---- 映射 PLATFORM 到 GOARCH ------------------------------------------------
+GOARCH_ARG=""
+if [[ -n "${PLATFORM}" ]]; then
+  # 从 linux/amd64 -> amd64, linux/arm64 -> arm64
+  GOARCH=$(echo "${PLATFORM}" | sed 's|linux/||')
+  GOARCH_ARG="--build-arg GOARCH=${GOARCH}"
+  echo "[build_benzhi] PLATFORM    = ${PLATFORM} (GOARCH=${GOARCH})"
+fi
 
 echo "[build_benzhi] TAG         = ${TAG}"
 echo "[build_benzhi] DOCKERFILE  = ${DOCKERFILE}"
@@ -89,6 +157,9 @@ BUILDX_ARGS=()
 if [[ "${NO_CACHE}" -eq 1 ]]; then
   BUILDX_ARGS+=( --no-cache )
 fi
+if [[ -n "${PLATFORM}" ]]; then
+  BUILDX_ARGS+=( --platform "${PLATFORM}" )
+fi
 if [[ "${LOAD}" -eq 1 ]]; then
   BUILDX_ARGS+=( --load )
 fi
@@ -99,7 +170,7 @@ fi
 # ---- 构建 --------------------------------------------------------------------
 echo "[build_benzhi] 开始构建镜像..."
 
-docker buildx build "${BUILDX_ARGS[@]}" "${BUILD_PROXY_ARGS[@]}" \
+docker buildx build "${BUILDX_ARGS[@]}" "${BUILD_PROXY_ARGS[@]}" ${GOARCH_ARG} \
   -t "${TAG}" \
   -f "${DOCKERFILE}" \
   .
