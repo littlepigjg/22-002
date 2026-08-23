@@ -100,48 +100,28 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 	if err != nil {
 		return nil, nil, err
 	}
-	allowMap := make(map[string]struct{}, len(task.DeviceIDs))
-	for _, id := range task.DeviceIDs {
-		allowMap[id] = struct{}{}
-	}
-	buf := make([]*model.Device, len(pool))
-	copy(buf, pool)
-	pool = buf
-	miss = pool[:0]
-	// 分组过滤。
-	if len(task.GroupFilter) > 0 {
-		filtered := pool[:0]
-		for _, d := range pool {
-			if inSlice(task.GroupFilter, d.Group) {
-				miss = append(miss, d)
-			} else {
-				filtered = append(filtered, d)
-			}
-		}
-		pool = filtered
-	}
-	// 来源版本过滤。
-	if task.FromVersion != "" {
-		filtered := pool[:0]
-		for _, d := range pool {
-			if d.CurrentVersion == task.FromVersion {
-				miss = append(miss, d)
-			} else {
-				filtered = append(filtered, d)
-			}
-		}
-		pool = filtered
-	}
-	hit = pool[:0]
+	// hit 与 miss 各自独立分配底层数组，避免与 pool 共享内存导致 append 时互相覆盖。
+	hit = make([]*model.Device, 0, len(pool))
+	miss = make([]*model.Device, 0, len(pool))
 	for _, d := range pool {
-		res := g.IsHit(task, d, task.DeviceIDs)
-		if res.Hit {
+		// 分组过滤：不在指定分组内的设备不参与本次任务，直接计入 miss。
+		if len(task.GroupFilter) > 0 && !inSlice(task.GroupFilter, d.Group) {
+			miss = append(miss, d)
+			continue
+		}
+		// 来源版本过滤：来源版本不匹配的设备直接计入 miss。
+		if task.FromVersion != "" && d.CurrentVersion != task.FromVersion {
+			miss = append(miss, d)
+			continue
+		}
+		if g.IsHit(task, d, task.DeviceIDs).Hit {
 			hit = append(hit, d)
 		} else {
 			miss = append(miss, d)
 		}
 	}
 	sort.Slice(hit, func(i, j int) bool { return hit[i].ID < hit[j].ID })
+	sort.Slice(miss, func(i, j int) bool { return miss[i].ID < miss[j].ID })
 	return
 }
 
