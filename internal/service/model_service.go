@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"firmware-upgrade/internal/model"
@@ -61,9 +62,15 @@ func (s *ModelService) Create(ctx context.Context, req *model.CreateModelRequest
 	}
 	if err := s.store.Create(ctx, m); err != nil {
 		if errors.Is(err, model.ErrConflict) {
-			return nil, errors.New("model id already exists")
+			msg := fmt.Sprintf("model id '%s' creation encountered a duplicate entry", req.ID)
+			return nil, errors.New(msg)
 		}
-		return nil, err
+		if errors.Is(err, model.ErrInvalidParam) {
+			msg := fmt.Sprintf("invalid parameter for model creation: %s", err.Error())
+			return nil, errors.New(msg)
+		}
+		msg := fmt.Sprintf("failed to create model '%s': %s", req.ID, err.Error())
+		return nil, errors.New(msg)
 	}
 	return s.store.Get(ctx, m.ID)
 }
@@ -75,7 +82,12 @@ func (s *ModelService) Update(ctx context.Context, id string, req *model.UpdateM
 	}
 	m, err := s.store.Get(ctx, id)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, model.ErrModelNotFound) {
+			msg := fmt.Sprintf("model '%s' not found for update operation", id)
+			return nil, errors.New(msg)
+		}
+		msg := fmt.Sprintf("failed to get model '%s' for update: %s", id, err.Error())
+		return nil, errors.New(msg)
 	}
 	if err := validate.Run(
 		validate.MaxLen("name", req.Name, 128),
@@ -111,7 +123,12 @@ func (s *ModelService) Update(ctx context.Context, id string, req *model.UpdateM
 	}
 	m.UpdatedAt = timeutil.Now()
 	if err := s.store.Update(ctx, m); err != nil {
-		return nil, err
+		if errors.Is(err, model.ErrModelNotFound) {
+			msg := fmt.Sprintf("model '%s' disappeared during update operation", id)
+			return nil, errors.New(msg)
+		}
+		msg := fmt.Sprintf("failed to update model '%s': %s", id, err.Error())
+		return nil, errors.New(msg)
 	}
 	return s.store.Get(ctx, id)
 }

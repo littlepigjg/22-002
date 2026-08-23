@@ -20,13 +20,14 @@ FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG GOSUMDB=sum.golang.org
 ARG CGO_ENABLED=0
+ARG GOARCH=amd64
 
 ENV GOPROXY=${GOPROXY} \
     GOSUMDB=${GOSUMDB} \
     CGO_ENABLED=${CGO_ENABLED} \
     GO111MODULE=on \
     GOOS=linux \
-    GOARCH=amd64
+    GOARCH=${GOARCH}
 
 WORKDIR /src
 
@@ -55,13 +56,20 @@ FROM alpine:${ALPINE_VERSION} AS runner
 ARG APP_UID=10001
 ARG APP_GID=10001
 
-# 运行时最小依赖：CA、时区、用户创建
-RUN apk add --no-cache ca-certificates tzdata curl \
+# 运行时最小依赖：CA、时区、用户创建 + Go 工具链（用于容器内 go build/go vet 验证）
+RUN apk add --no-cache ca-certificates tzdata curl git \
     && addgroup -g ${APP_GID} -S appgroup \
     && adduser  -u ${APP_UID} -S appuser -G appgroup -h /app -s /sbin/nologin \
     && mkdir -p /app/data/firmwares /app/data/uploads /app/web \
     && chown -R ${APP_UID}:${APP_GID} /app \
     && rm -rf /var/cache/apk/* /tmp/*
+
+# 从 builder 拷贝 Go 工具链
+COPY --from=builder /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH
+
+# 从 builder 拷贝项目源码（用于容器内 go build/go vet 验证）
+COPY --from=builder /src /app
 
 ENV TZ=Asia/Shanghai \
     LANG=C.UTF-8 \
@@ -76,11 +84,8 @@ ENV TZ=Asia/Shanghai \
 
 WORKDIR /app
 
-# 二进制
+# 拷贝编译好的二进制到运行位置
 COPY --from=builder /out/server /app/server
-
-# 前端静态资源目录（若构建时已内嵌 go:embed 则无需复制；这里也保留显式目录兜底）
-COPY web /app/web
 
 # 运行用户与暴露端口
 USER ${APP_UID}:${APP_GID}

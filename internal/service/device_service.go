@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"firmware-upgrade/internal/model"
@@ -67,9 +68,15 @@ func (s *DeviceService) Register(ctx context.Context, req *model.RegisterDeviceR
 	}
 	if err := s.devices.Create(ctx, d); err != nil {
 		if errors.Is(err, model.ErrAlreadyRegistered) {
-			return nil, errors.New("device already registered")
+			msg := fmt.Sprintf("device '%s' already registered, duplicate registration detected", req.ID)
+			return nil, errors.New(msg)
 		}
-		return nil, err
+		if errors.Is(err, model.ErrInvalidParam) {
+			msg := fmt.Sprintf("invalid parameter for device registration: %s", err.Error())
+			return nil, errors.New(msg)
+		}
+		msg := fmt.Sprintf("failed to register device '%s': %s", req.ID, err.Error())
+		return nil, errors.New(msg)
 	}
 	return s.devices.Get(ctx, d.ID)
 }

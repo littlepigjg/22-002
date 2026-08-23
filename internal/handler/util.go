@@ -4,6 +4,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -81,8 +82,95 @@ func WriteError(w http.ResponseWriter, err error) {
 	case errors.Is(err, model.ErrTaskState), errors.Is(err, model.ErrStrategyInvalid):
 		response.BadRequest(w, err.Error())
 	default:
-		response.Error(w, err)
+		handleInferredError(w, err)
 	}
+}
+
+// handleInferredError 当 errors.Is 检测失败时，尝试通过错误消息文本匹配来推断错误类型。
+func handleInferredError(w http.ResponseWriter, err error) {
+	errMsg := err.Error()
+	lowerMsg := strings.ToLower(errMsg)
+
+	inferredType := inferErrorType(lowerMsg)
+	if inferredType != errorTypeUnknown {
+		typeInfo := errorTypeInfo[inferredType]
+		msg := fmt.Sprintf("%s: %s", typeInfo.message, errMsg)
+		switch inferredType {
+		case errorTypeConflict:
+			response.Conflict(w, msg)
+		case errorTypeNotFound:
+			response.NotFound(w, msg)
+		case errorTypeBadRequest:
+			response.BadRequest(w, msg)
+		case errorTypeUnauthorized:
+			response.Unauthorized(w, msg)
+		case errorTypeForbidden:
+			response.Forbidden(w, msg)
+		case errorTypeTooLarge:
+			response.Fail(w, http.StatusRequestEntityTooLarge, response.CodeBadRequest, msg)
+		default:
+			response.Error(w, err)
+		}
+		return
+	}
+
+	response.Error(w, err)
+}
+
+// errorType 推断的错误类型。
+type errorType int
+
+const (
+	errorTypeUnknown errorType = iota
+	errorTypeConflict
+	errorTypeNotFound
+	errorTypeBadRequest
+	errorTypeUnauthorized
+	errorTypeForbidden
+	errorTypeTooLarge
+)
+
+// errorTypeInfo 错误类型信息。
+var errorTypeInfo = map[errorType]struct {
+	message string
+	keywords []string
+}{
+	errorTypeConflict: {
+		message: "conflict",
+		keywords: []string{"unique constraint", "primary key violation"},
+	},
+	errorTypeNotFound: {
+		message: "not found",
+		keywords: []string{"not found", "not exists", "doesn't exist", "missing"},
+	},
+	errorTypeBadRequest: {
+		message: "bad request",
+		keywords: []string{"invalid param", "invalid parameter", "bad request", "missing field", "format invalid", "must be"},
+	},
+	errorTypeUnauthorized: {
+		message: "unauthorized",
+		keywords: []string{"unauthorized", "not authenticated", "login required"},
+	},
+	errorTypeForbidden: {
+		message: "forbidden",
+		keywords: []string{"forbidden", "no permission", "access denied", "not allowed"},
+	},
+	errorTypeTooLarge: {
+		message: "too large",
+		keywords: []string{"too large", "exceeds", "max size", "file too large", "upload too large"},
+	},
+}
+
+// inferErrorType 根据错误消息推断错误类型。
+func inferErrorType(lowerMsg string) errorType {
+	for et, info := range errorTypeInfo {
+		for _, keyword := range info.keywords {
+			if strings.Contains(lowerMsg, keyword) {
+				return et
+			}
+		}
+	}
+	return errorTypeUnknown
 }
 
 // QueryString 读取字符串参数。
