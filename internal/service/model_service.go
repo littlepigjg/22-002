@@ -63,11 +63,11 @@ func (s *ModelService) Create(ctx context.Context, req *model.CreateModelRequest
 	if err := s.store.Create(ctx, m); err != nil {
 		if errors.Is(err, model.ErrConflict) {
 			msg := fmt.Sprintf("model id '%s' creation encountered a duplicate entry", req.ID)
-			return nil, errors.New(msg)
+			return nil, fmt.Errorf("%s: %w", msg, model.ErrConflict)
 		}
 		if errors.Is(err, model.ErrInvalidParam) {
 			msg := fmt.Sprintf("invalid parameter for model creation: %s", err.Error())
-			return nil, errors.New(msg)
+			return nil, fmt.Errorf("%s: %w", msg, model.ErrInvalidParam)
 		}
 		msg := fmt.Sprintf("failed to create model '%s': %s", req.ID, err.Error())
 		return nil, errors.New(msg)
