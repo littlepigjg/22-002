@@ -117,8 +117,10 @@ func (e *UploadProcessingError) Unwrap() error {
 }
 
 // resolveUploadHTTPStatus determines the appropriate HTTP status code for an
-// UploadProcessingError by examining the underlying cause. It should distinguish
-// between client errors (file too large) and server errors (disk full, permission denied).
+// UploadProcessingError by examining the underlying cause. It distinguishes between
+// client errors (invalid multipart → 400, file too large → 413) and server errors
+// (disk full, permission denied → 500). The cause carries the original errno, so
+// isSystemError can match ENOSPC/EDQUOT/EACCES/EPERM across the error chain.
 func resolveUploadHTTPStatus(err *UploadProcessingError) int {
 	if err == nil {
 		return http.StatusInternalServerError
@@ -129,6 +131,9 @@ func resolveUploadHTTPStatus(err *UploadProcessingError) int {
 	}
 	if errors.Is(cause, model.ErrInvalidParam) {
 		return http.StatusBadRequest
+	}
+	if isSystemError(cause) {
+		return http.StatusInternalServerError
 	}
 	return http.StatusRequestEntityTooLarge
 }
@@ -145,6 +150,12 @@ func buildUploadErrorMessage(err *UploadProcessingError) string {
 // isSystemError checks whether an error originates from a system-level failure
 // such as disk space exhaustion or permission denied, which should result in
 // a 500 Internal Server Error rather than a 4xx client error.
+//
+// os.IsPermission only recognizes *fs.PathError carrying EACCES/EPERM and does
+// not traverse generic %w-wrapped errno chains, so we additionally match the
+// EACCES/EPERM errnos via errors.Is. This covers both os-level PathErrors and
+// errors wrapped by fmt.Errorf("%w", syscall.EACCES) as produced by the
+// multipart temp-file writer.
 func isSystemError(err error) bool {
 	if err == nil {
 		return false
@@ -153,6 +164,9 @@ func isSystemError(err error) bool {
 		return true
 	}
 	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+		return true
+	}
+	if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
 		return true
 	}
 	return false
