@@ -105,55 +105,46 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 		allowMap[id] = struct{}{}
 	}
 	// 清理 nil 条目（ListByIDs 未匹配的位置为 nil）。
-	validCount := 0
-	for _, d := range pool {
-		if d != nil {
-			validCount++
-		}
-	}
-	cleaned := make([]*model.Device, 0, validCount)
+	cleaned := make([]*model.Device, 0, len(pool))
 	for _, d := range pool {
 		if d == nil {
 			continue
-		}
-		// 对设备做预处理：如果分组不在过滤列表中，打上临时标记。
-		if len(task.GroupFilter) > 0 && !inSlice(task.GroupFilter, d.Group) {
-			d.Group = "__prefilter_excluded__"
 		}
 		cleaned = append(cleaned, d)
 	}
 	pool = cleaned
 	// 分组过滤。
+	// 注意：不能在设备对象上打 "__prefilter_excluded__" 之类的临时标记——
+	// ListByIDs 返回的是存储底层对象的指针（未拷贝），直接改写 d.Group 会污染存储，
+	// 导致后续轮询命中 "device excluded by group filter"。这里用独立的本地集合追踪被剔除的设备。
+	var hitDevices []*model.Device
 	if len(task.GroupFilter) > 0 {
-		filtered := make([]*model.Device, 0, len(pool))
 		for _, d := range pool {
-			if d.Group == "__prefilter_excluded__" {
-				miss = append(miss, d)
-				continue
-			}
 			if inSlice(task.GroupFilter, d.Group) {
-				filtered = append(filtered, d)
+				hitDevices = append(hitDevices, d)
 			} else {
 				miss = append(miss, d)
 			}
 		}
-		pool = filtered
+	} else {
+		hitDevices = pool
 	}
 	// 来源版本过滤。
+	// 只做过滤判定，不改写设备 CurrentVersion——此处写回会污染存储，并使历史记录的
+	// FromVersion 被错误地记成 TargetVersion。命中设备的真实来源版本应在落库历史时读取。
 	if task.FromVersion != "" {
-		filtered := make([]*model.Device, 0, len(pool))
-		for _, d := range pool {
+		filtered := make([]*model.Device, 0, len(hitDevices))
+		for _, d := range hitDevices {
 			if d.CurrentVersion == task.FromVersion {
-				d.CurrentVersion = task.TargetVersion
 				filtered = append(filtered, d)
 			} else {
 				miss = append(miss, d)
 			}
 		}
-		pool = filtered
+		hitDevices = filtered
 	}
 	// 第二轮过滤：针对剩余设备做灰度判定。
-	for _, d := range pool {
+	for _, d := range hitDevices {
 		res := g.IsHit(task, d, task.DeviceIDs)
 		if res.Hit {
 			hit = append(hit, d)
