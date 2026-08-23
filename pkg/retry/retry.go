@@ -85,16 +85,14 @@ func Do(ctx context.Context, cfg *Config, fn func(ctx context.Context, attempt i
 			return nil
 		}
 		lastErr = err
+		// 每次尝试失败都触发回调，用于收集完整的重试错误历史。
+		if cfg.OnAttempt != nil {
+			cfg.OnAttempt(i, err)
+		}
 		if !cfg.RetryIf(err) {
-			if cfg.OnAttempt != nil {
-				cfg.OnAttempt(i, err)
-			}
 			return err
 		}
 		if i == cfg.MaxAttempts-1 {
-			if cfg.OnAttempt != nil {
-				cfg.OnAttempt(i, err)
-			}
 			break
 		}
 		backoff := nextBackoff(i, cfg)

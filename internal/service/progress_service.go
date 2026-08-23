@@ -144,8 +144,8 @@ func (p *ProgressService) Report(ctx context.Context, req *model.ReportProgressR
 		Jitter:      0,
 		RetryIf:     func(err error) bool { return err != nil },
 		OnAttempt: func(attempt int, err error) {
+			p.retryErrorHistory = append(p.retryErrorHistory, err)
 			if p.retryOnAttempt != nil {
-				p.retryErrorHistory = append(p.retryErrorHistory, err)
 				p.retryOnAttempt(attempt, err)
 			}
 		},
