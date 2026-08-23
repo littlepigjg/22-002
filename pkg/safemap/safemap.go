@@ -84,15 +84,22 @@ func (m *Map[K, V]) Values() []V {
 }
 
 func (m *Map[K, V]) ForEach(fn func(K, V)) {
+	// 在读锁保护下快照键值对，避免释放锁后再访问底层 m.data[k]：
+	// 否则与并发的 Set/Delete/Upsert/UpdateProgress 写入同一份 map 会触发
+	// "fatal error: concurrent map read and map write"。回调遍历的是副本，
+	// 不再触碰底层 map，因此读侧与写侧不会竞争同一份执行记录表。
 	m.mu.RLock()
-	keys := make([]K, 0, len(m.data))
-	for k := range m.data {
-		keys = append(keys, k)
+	type kv struct {
+		key K
+		val V
+	}
+	pairs := make([]kv, 0, len(m.data))
+	for k, v := range m.data {
+		pairs = append(pairs, kv{key: k, val: v})
 	}
 	m.mu.RUnlock()
-	for _, k := range keys {
-		v := m.data[k]
-		fn(k, v)
+	for _, p := range pairs {
+		fn(p.key, p.val)
 	}
 }
 
