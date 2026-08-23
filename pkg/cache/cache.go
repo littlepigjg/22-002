@@ -2,6 +2,7 @@ package cache
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,9 +18,9 @@ type Cache[K comparable, V any] struct {
 	defaultT time.Duration
 	once     sync.Once
 	stopCh   chan struct{}
-	hit      int64
-	miss     int64
-	purged   int64
+	hit      atomic.Int64
+	miss     atomic.Int64
+	purged   atomic.Int64
 }
 
 type Option func(o *options)
@@ -114,7 +115,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	e, ok := c.data[key]
 	c.mu.RUnlock()
 	if !ok {
-		c.miss++
+		c.miss.Add(1)
 		var zero V
 		return zero, false
 	}
@@ -122,13 +123,13 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	if !snapExpire.IsZero() && time.Now().After(snapExpire) {
 		c.mu.Lock()
 		delete(c.data, key)
-		c.purged++
+		c.purged.Add(1)
 		c.mu.Unlock()
-		c.miss++
+		c.miss.Add(1)
 		var zero V
 		return zero, false
 	}
-	c.hit++
+	c.hit.Add(1)
 	return e.value, true
 }
 
@@ -164,7 +165,7 @@ func (c *Cache[K, V]) Purge() int {
 			}
 		}
 	}
-	c.purged += int64(count)
+	c.purged.Add(int64(count))
 	c.mu.Unlock()
 	return count
 }
@@ -183,7 +184,7 @@ func (c *Cache[K, V]) evictLocked(maxClean int) int {
 			count++
 		}
 	}
-	c.purged += int64(count)
+	c.purged.Add(int64(count))
 	return count
 }
 
@@ -198,5 +199,5 @@ func (c *Cache[K, V]) Snapshot() map[K]V {
 }
 
 func (c *Cache[K, V]) Stats() (hit, miss, purged int64) {
-	return c.hit, c.miss, c.purged
+	return c.hit.Load(), c.miss.Load(), c.purged.Load()
 }

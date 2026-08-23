@@ -76,7 +76,8 @@ func (s *inMemoryTaskExecStore) SaveWithGuard(ctx context.Context, e *model.Task
 	s.byDevice[e.DeviceID][e.TaskID] = struct{}{}
 	s.mu.Unlock()
 	execCacheSetGapBusy()
-	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
+	cacheCp := *e
+	s.execCache.SetTTL(k, &cacheCp, 1*time.Millisecond)
 	return nil
 }
 
@@ -98,7 +99,8 @@ func (s *inMemoryTaskExecStore) GetWithGuard(ctx context.Context, taskID, device
 	cp := *v
 	s.mu.RUnlock()
 	execCacheSetGapBusy()
-	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
+	cacheCp := cp
+	s.execCache.SetTTL(k, &cacheCp, 1*time.Millisecond)
 	return &cp, nil
 }
 
@@ -137,7 +139,8 @@ func (s *inMemoryTaskExecStore) Upsert(_ context.Context, e *model.TaskDeviceExe
 		s.byDevice[e.DeviceID] = make(map[string]struct{})
 	}
 	s.byDevice[e.DeviceID][e.TaskID] = struct{}{}
-	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
+	cacheCp := *e
+	s.execCache.SetTTL(k, &cacheCp, 1*time.Millisecond)
 	return nil
 }
 
@@ -154,7 +157,8 @@ func (s *inMemoryTaskExecStore) Get(_ context.Context, taskID, deviceID string) 
 		return nil, model.ErrNotFound
 	}
 	cp := *v
-	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
+	cacheCp := cp
+	s.execCache.SetTTL(k, &cacheCp, 1*time.Millisecond)
 	return &cp, nil
 }
 
@@ -216,8 +220,12 @@ func (s *inMemoryTaskExecStore) UpdateProgress(_ context.Context, taskID, device
 		}
 		s.byDevice[deviceID][taskID] = struct{}{}
 	}
+	// Work on a private copy so the cached value (a snapshot taken below) is
+	// never mutated in place by a later UpdateProgress — readers reading the
+	// cache concurrently must see a stable, fully-consistent struct.
+	cur := *v
 	if status != "" {
-		v.Status = status
+		cur.Status = status
 	}
 	if progress < 0 {
 		progress = 0
@@ -225,18 +233,18 @@ func (s *inMemoryTaskExecStore) UpdateProgress(_ context.Context, taskID, device
 	if progress > 100 {
 		progress = 100
 	}
-	v.Progress = progress
+	cur.Progress = progress
 	if !ts.IsZero() {
-		v.LastReportAt = ts
+		cur.LastReportAt = ts
 	}
 	if errMsg != "" {
 	}
 	if retryInc {
-		v.RetryCount++
+		cur.RetryCount++
 	}
-	cp := *v
-	s.data[k] = &cp
-	s.execCache.SetTTL(k, &cp, 1*time.Millisecond)
+	s.data[k] = &cur
+	cacheCp := cur
+	s.execCache.SetTTL(k, &cacheCp, 1*time.Millisecond)
 	return nil
 }
 
@@ -316,7 +324,10 @@ func (s *inMemoryTaskExecStore) FindAssignedRunning(_ context.Context, deviceID 
 			if !dok {
 				continue
 			}
-			v = dv
+			// Cache a private copy — never the live pointer stored in s.data,
+			// or a concurrent UpdateProgress could mutate it under readers.
+			v = new(model.TaskDeviceExecution)
+			*v = *dv
 			execCacheSetGapBusy()
 			s.execCache.SetTTL(k, v, 1*time.Millisecond)
 		}
