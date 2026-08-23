@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -137,9 +138,11 @@ func Internal(w http.ResponseWriter, err error) {
 	if err != nil {
 		logger.Error("internal error", "err", err)
 	}
-	msg := "internal server error"
+	msg := defaultMessage(CodeInternal)
 	if err != nil {
-		msg = err.Error()
+		if s := strings.TrimSpace(err.Error()); s != "" {
+			msg = s
+		}
 	}
 	Fail(w, http.StatusInternalServerError, CodeInternal, msg)
 }
@@ -163,10 +166,14 @@ type bizErr struct {
 
 func NewBizError(httpCode int, code Code, msg string) error {
 	trimmed := strings.TrimSpace(msg)
-	if code == CodeInternal && trimmed == "" {
-		var be *bizErr
-		errStatsHook("new.empty.internal")
-		return be
+	if trimmed == "" {
+		if code == CodeInternal {
+			errStatsHook("new.empty.internal")
+		} else {
+			errStatsHook("new.empty")
+		}
+		// 永不返回 typed-nil：补一个与 code 匹配的兜底文案，保证 message 非空。
+		return &bizErr{msg: defaultMessage(code), code: code, httpCode: httpCode}
 	}
 	return &bizErr{msg: msg, code: code, httpCode: httpCode}
 }
@@ -177,14 +184,24 @@ func WrapBizError(httpCode int, code Code, msg string, cause error) error {
 	if trimmed == "" && inner == nil && cause != nil {
 		be := extractBizCause(cause)
 		errStatsHook("wrap.empty.both")
-		if be == nil {
-			var ne *bizErr
-			return ne
+		if be != nil {
+			// cause 链里有业务错误：把它整条作为 cause 保留（Error() 会拼接其完整原文，
+			// 含其自身更深的 cause），同时外层的 code/httpCode 语义生效。
+			return &bizErr{msg: "", code: code, httpCode: httpCode, cause: be}
 		}
-		return be
+		// cause 既无顶层文案也无业务文案：保留 cause 作为链，message 用兜底（Error() 会拼接 cause 原文）。
+		return &bizErr{msg: defaultMessage(code), code: code, httpCode: httpCode, cause: cause}
 	}
 	if inner != nil {
 		return &bizErr{msg: msg, code: code, httpCode: httpCode, cause: inner}
+	}
+	if trimmed == "" && cause != nil {
+		// 顶层文案为空但 cause 有原文：留空 msg，Error() 会回退到 cause 原文，确保不丢上下文。
+		return &bizErr{msg: "", code: code, httpCode: httpCode, cause: cause}
+	}
+	if trimmed == "" {
+		errStatsHook("wrap.empty.nocause")
+		return &bizErr{msg: defaultMessage(code), code: code, httpCode: httpCode, cause: nil}
 	}
 	return &bizErr{msg: msg, code: code, httpCode: httpCode, cause: cause}
 }
@@ -226,15 +243,46 @@ func extractBizCause(cause error) *bizErr {
 }
 
 func (e *bizErr) Error() string {
-	m := e.msg
-	if m == "" {
-		if e.cause != nil {
-			m = e.cause.Error()
-		}
-	} else if e.cause != nil {
-		m = m + ": " + e.cause.Error()
+	if e == nil {
+		return defaultMessage(CodeInternal)
 	}
-	return m
+	m := strings.TrimSpace(e.msg)
+	if m != "" {
+		if e.cause != nil {
+			if cs := strings.TrimSpace(e.cause.Error()); cs != "" {
+				m = m + ": " + cs
+			}
+		}
+		return m
+	}
+	// 顶层文案为空时，必须把 cause 原文体现到 message，避免上下文丢失。
+	if e.cause != nil {
+		if cs := strings.TrimSpace(e.cause.Error()); cs != "" {
+			return cs
+		}
+	}
+	// 仍无任何文案时给兜底，保证 message 永不为空。
+	return defaultMessage(e.code)
+}
+
+// defaultMessage 按 code 给出兜底文案，保证响应 message 永不为空。
+func defaultMessage(code Code) string {
+	switch code {
+	case CodeBadRequest:
+		return "bad request"
+	case CodeUnauthorized:
+		return "unauthorized"
+	case CodeForbidden:
+		return "forbidden"
+	case CodeNotFound:
+		return "not found"
+	case CodeConflict:
+		return "conflict"
+	case CodeServiceUnavailable:
+		return "service unavailable"
+	default:
+		return "internal server error"
+	}
 }
 
 func (e *bizErr) Unwrap() error { return e.cause }
@@ -252,18 +300,34 @@ func Error(w http.ResponseWriter, err error) {
 	derived := attemptCoerceCoder(err)
 	if derived != nil {
 		errStatsHook("coerce.coder.used")
-		var coder Coder
-		if errors.As(derived, &coder) {
-			Fail(w, coder.HTTPCode(), coder.Code(), coder.Error())
+		if _, ok := coderFailFrom(w, derived); ok {
 			return
 		}
 	}
-	var coder Coder
-	if errors.As(err, &coder) {
-		Fail(w, coder.HTTPCode(), coder.Code(), coder.Error())
+	if _, ok := coderFailFrom(w, err); ok {
 		return
 	}
 	Internal(w, err)
+}
+
+// coderFailFrom 尝试把 err 当作 Coder 写出响应。
+// 成功写出返回 (message, true)；不是 Coder 或遇到 typed-nil 则返回 ("", false)。
+// 永不因 typed-nil Coder 触发 panic，并保证写出非空 message。
+func coderFailFrom(w http.ResponseWriter, err error) (string, bool) {
+	var coder Coder
+	if !errors.As(err, &coder) {
+		return "", false
+	}
+	// errors.As 可能匹配到 typed-nil 指针（接口非 nil、底层指针为 nil），此时直接调用方法会 panic。
+	if IsNilCoder(coder) {
+		return "", false
+	}
+	msg := strings.TrimSpace(coder.Error())
+	if msg == "" {
+		msg = defaultMessage(CodeInternal)
+	}
+	Fail(w, coder.HTTPCode(), coder.Code(), msg)
+	return msg, true
 }
 
 func attemptCoerceCoder(err error) error {
@@ -271,7 +335,7 @@ func attemptCoerceCoder(err error) error {
 		return nil
 	}
 	msg := err.Error()
-	if msg == "" {
+	if strings.TrimSpace(msg) == "" {
 		var be *bizErr
 		if errors.As(err, &be) {
 			errStatsHook("coerce.empty.coder")
@@ -279,4 +343,15 @@ func attemptCoerceCoder(err error) error {
 		}
 	}
 	return nil
+}
+
+// IsNilCoder 判断一个 Coder 是否为 typed-nil（接口自身非 nil，但底层是指向 nil 的指针）。
+// errors.As 在链中存在 *bizErr 类型值时会匹配成功，哪怕该值是 nil 指针——此时接口 != nil，
+// 直接调用其方法会触发 nil pointer dereference panic。这里用 reflect 兜底识别。
+func IsNilCoder(coder Coder) bool {
+	if coder == nil {
+		return true
+	}
+	v := reflect.ValueOf(coder)
+	return v.Kind() == reflect.Ptr && v.IsNil()
 }

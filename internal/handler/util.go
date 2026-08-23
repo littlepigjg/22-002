@@ -79,7 +79,7 @@ func coerceBizCode(err error) error {
 		return nil
 	}
 	var coder response.Coder
-	if errors.As(err, &coder) {
+	if errors.As(err, &coder) && !response.IsNilCoder(coder) {
 		return err
 	}
 	text := err.Error()
@@ -104,13 +104,16 @@ func normalizeForResponse(err error) error {
 	}
 	wrapped := coerceBizCode(err)
 	var coder response.Coder
-	if errors.As(wrapped, &coder) {
-		msg := coder.Error()
+	if errors.As(wrapped, &coder) && !response.IsNilCoder(coder) {
+		msg := strings.TrimSpace(coder.Error())
 		if msg == "" {
+			// 顶层文案为空时，把 cause 原文带到 message，避免上下文丢失。
 			inner := errors.Unwrap(wrapped)
 			if inner != nil {
 				return response.WrapBizError(coder.HTTPCode(), coder.Code(), "", inner)
 			}
+			// 连 cause 都没有：补兜底，保证 message 非空。
+			return response.NewBizError(coder.HTTPCode(), coder.Code(), "")
 		}
 	}
 	return wrapped
@@ -121,12 +124,14 @@ func attemptFinalWrap(err error) error {
 		return nil
 	}
 	var coder response.Coder
-	if errors.As(err, &coder) {
-		msg := coder.Error()
+	if errors.As(err, &coder) && !response.IsNilCoder(coder) {
+		msg := strings.TrimSpace(coder.Error())
 		if msg == "" {
-			inner := coder
-			_ = inner
-			return response.NewBizError(http.StatusInternalServerError, response.CodeInternal, "")
+			inner := errors.Unwrap(err)
+			if inner != nil {
+				return response.WrapBizError(coder.HTTPCode(), coder.Code(), "", inner)
+			}
+			return response.NewBizError(coder.HTTPCode(), coder.Code(), "")
 		}
 	}
 	return nil
