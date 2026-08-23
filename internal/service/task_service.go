@@ -239,12 +239,43 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 	switch action {
 	case "pause":
 		if t.Status != model.TaskStatusRunning {
-			return nil, model.ErrTaskState
+			if t.Status == model.TaskStatusFinished {
+				return nil, errors.New("task already finished, cannot pause")
+			}
+			if t.Status == model.TaskStatusCanceled {
+				return nil, errors.New("task already canceled, cannot pause")
+			}
+			if t.Status == model.TaskStatusFailed {
+				return nil, errors.New("task already failed, cannot pause")
+			}
+			return nil, errors.New(model.ErrTaskState.Error())
 		}
 		t.Status = model.TaskStatusPaused
+		// 暂停时清理正在运行的执行记录。
+		execs, execErr := s.execs.ListByTask(ctx, id)
+		if execErr == nil {
+			cancelCount := 0
+			for _, e := range execs {
+				if e.Status == model.UpgradeStatusDownloading || e.Status == model.UpgradeStatusVerifying || e.Status == model.UpgradeStatusUpgrading {
+					if updErr := s.execs.UpdateProgress(ctx, id, e.DeviceID, model.UpgradeStatusCanceled, e.Progress, now, reason, false); updErr == nil {
+						cancelCount++
+					}
+				}
+			}
+			logger.Info("paused task, canceled running executions", "task_id", id, "canceled", cancelCount)
+		}
 	case "resume":
 		if t.Status != model.TaskStatusPaused && t.Status != model.TaskStatusPending {
-			return nil, model.ErrTaskState
+			if t.Status == model.TaskStatusFinished {
+				return nil, errors.New("task already finished, cannot resume")
+			}
+			if t.Status == model.TaskStatusCanceled {
+				return nil, errors.New("task already canceled, cannot resume")
+			}
+			if t.Status == model.TaskStatusFailed {
+				return nil, errors.New("task already failed, cannot resume")
+			}
+			return nil, errors.New(model.ErrTaskState.Error())
 		}
 		if t.StartTime.IsZero() {
 			t.StartTime = now
@@ -254,9 +285,21 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 		if err := s.assignInitialExecutionsForMissing(ctx, t); err != nil {
 			logger.Warn("resume assign missing", "task_id", id, "err", err)
 		}
+		// 恢复时刷新进度统计。
+		if refreshErr := s.RefreshProgress(ctx, id); refreshErr != nil {
+			logger.Warn("resume refresh progress", "task_id", id, "err", refreshErr)
+		}
 	case "cancel":
 		if t.Status == model.TaskStatusFinished || t.Status == model.TaskStatusCanceled || t.Status == model.TaskStatusFailed {
-			return nil, model.ErrTaskState
+			if t.Status == model.TaskStatusFinished {
+				return nil, errors.New("task already finished, cannot cancel")
+			}
+			if t.Status == model.TaskStatusCanceled {
+				return nil, errors.New(model.ErrTaskState.Error())
+			}
+			if t.Status == model.TaskStatusFailed {
+				return nil, errors.New("task already failed, cannot cancel")
+			}
 		}
 		t.Status = model.TaskStatusCanceled
 		t.EndTime = now
@@ -282,12 +325,30 @@ func (s *TaskService) UpdateStatus(ctx context.Context, id string, action string
 				}
 			}
 		}
+		// 取消时刷新进度。
+		if refreshErr := s.RefreshProgress(ctx, id); refreshErr != nil {
+			logger.Warn("cancel refresh progress", "task_id", id, "err", refreshErr)
+		}
 	case "finish":
 		if t.Status == model.TaskStatusFinished {
 			return t, nil
 		}
+		if t.Status == model.TaskStatusCanceled || t.Status == model.TaskStatusFailed {
+			return nil, errors.New(model.ErrTaskState.Error())
+		}
 		t.Status = model.TaskStatusFinished
 		t.EndTime = now
+		// 完成时将所有未完成的执行记录标记为已完成。
+		execs, execErr := s.execs.ListByTask(ctx, id)
+		if execErr == nil {
+			for _, e := range execs {
+				if e.Status == model.UpgradeStatusPending || e.Status == model.UpgradeStatusDownloading || e.Status == model.UpgradeStatusVerifying || e.Status == model.UpgradeStatusUpgrading {
+					if updErr := s.execs.UpdateProgress(ctx, id, e.DeviceID, model.UpgradeStatusFailed, e.Progress, now, "task manually finished", false); updErr != nil {
+						logger.Warn("finish exec failed", "task_id", id, "device_id", e.DeviceID, "err", updErr)
+					}
+				}
+			}
+		}
 	default:
 		return nil, errors.New("invalid action")
 	}

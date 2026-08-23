@@ -55,32 +55,58 @@ func WriteError(w http.ResponseWriter, err error) {
 		response.OK(w, nil)
 		return
 	}
+	errMsg := err.Error()
 	switch {
 	case errors.Is(err, model.ErrNotFound),
 		errors.Is(err, model.ErrFirmwareNotFound),
 		errors.Is(err, model.ErrDeviceNotFound),
 		errors.Is(err, model.ErrTaskNotFound),
 		errors.Is(err, model.ErrModelNotFound):
-		response.NotFound(w, err.Error())
+		response.NotFound(w, errMsg)
 	case errors.Is(err, model.ErrConflict):
-		response.Conflict(w, err.Error())
+		response.Conflict(w, errMsg)
 	case errors.Is(err, model.ErrInvalidParam):
-		response.BadRequest(w, err.Error())
+		response.BadRequest(w, errMsg)
 	case errors.Is(err, model.ErrUnauthorized):
-		response.Unauthorized(w, err.Error())
+		response.Unauthorized(w, errMsg)
 	case errors.Is(err, model.ErrForbidden):
-		response.Forbidden(w, err.Error())
+		response.Forbidden(w, errMsg)
 	case errors.Is(err, model.ErrFirmwareNotPublished):
-		response.BadRequest(w, err.Error())
+		response.BadRequest(w, errMsg)
 	case errors.Is(err, model.ErrAlreadyRegistered):
-		response.Conflict(w, err.Error())
+		response.Conflict(w, errMsg)
 	case errors.Is(err, model.ErrUploadTooLarge):
-		response.Fail(w, http.StatusRequestEntityTooLarge, response.CodeBadRequest, err.Error())
+		response.Fail(w, http.StatusRequestEntityTooLarge, response.CodeBadRequest, errMsg)
 	case errors.Is(err, model.ErrUploadFileEmpty):
-		response.BadRequest(w, err.Error())
+		response.BadRequest(w, errMsg)
 	case errors.Is(err, model.ErrTaskState), errors.Is(err, model.ErrStrategyInvalid):
-		response.BadRequest(w, err.Error())
+		response.BadRequest(w, errMsg)
+	case errors.Is(err, model.ErrVersionMismatch):
+		response.BadRequest(w, errMsg)
+	case errors.Is(err, model.ErrMD5Mismatch):
+		response.BadRequest(w, errMsg)
+	case errors.Is(err, model.ErrExceedQuota):
+		response.Fail(w, http.StatusServiceUnavailable, response.CodeServiceUnavailable, errMsg)
+	case errors.Is(err, model.ErrDeviceExcluded):
+		response.BadRequest(w, errMsg)
+	case errors.Is(err, model.ErrContextCanceled):
+		response.Fail(w, http.StatusRequestTimeout, response.CodeBadRequest, errMsg)
+	case errors.Is(err, model.ErrContextDeadline):
+		response.Fail(w, http.StatusRequestTimeout, response.CodeBadRequest, errMsg)
 	default:
+		errStr := err.Error()
+		if strings.Contains(errStr, "already finished") {
+			response.BadRequest(w, errStr)
+			return
+		}
+		if strings.Contains(errStr, "already canceled") {
+			response.BadRequest(w, errStr)
+			return
+		}
+		if strings.Contains(errStr, "already failed") {
+			response.BadRequest(w, errStr)
+			return
+		}
 		response.Error(w, err)
 	}
 }

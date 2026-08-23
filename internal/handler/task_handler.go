@@ -77,8 +77,31 @@ func (h *TaskHandler) Action(w http.ResponseWriter, r *http.Request) {
 		action = r.URL.Query().Get("action")
 	}
 	reason := req.Reason
+	if action == "" {
+		response.Fail(w, http.StatusBadRequest, response.CodeBadRequest, "action is required")
+		return
+	}
+	validActions := map[string]bool{
+		"pause":  true,
+		"resume": true,
+		"cancel": true,
+		"finish": true,
+	}
+	if !validActions[action] {
+		response.Fail(w, http.StatusBadRequest, response.CodeBadRequest, "invalid action: "+action)
+		return
+	}
 	res, err := h.svc.UpdateStatus(r.Context(), id, action, reason)
 	if err != nil {
+		errMsg := err.Error()
+		if action == "pause" && errMsg == "task state transition illegal" {
+			response.BadRequest(w, errMsg)
+			return
+		}
+		if action == "resume" && errMsg == "task state transition illegal" {
+			response.BadRequest(w, errMsg)
+			return
+		}
 		WriteError(w, err)
 		return
 	}
