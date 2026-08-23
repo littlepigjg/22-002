@@ -76,13 +76,14 @@ func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (
 	}
 
 	if e, ok, err := p.execs.FindAssignedRunning(ctx, req.DeviceID); err == nil && ok {
-		preferredID := e.TaskID
-		if strutil.IsEmpty(preferredID) {
-			var fallback string
-			_ = fallback
-			preferredID = e.TaskID
+		// 脏执行记录兜底：历史遗留或手工运维可能写入 TaskID 为空的 pending 记录
+		// （由 InsertWithGuard 之类的诊断钩子注入），这种记录无法解析出真实任务，
+		// 直接带去 buildResponse 会对 nil 任务做指针解引用导致 panic。这里识别后跳过，
+		// 落到下面正常的任务分配流程，保证设备仍能拿到可升级任务或干净返回 NeedUpgrade=false。
+		if !strutil.IsEmpty(e.TaskID) {
+			return p.buildResponse(ctx, e.TaskID, dev)
 		}
-		return p.buildResponse(ctx, preferredID, dev)
+		logger.Warn("poll: skip dirty exec record with empty task id", "device_id", req.DeviceID)
 	}
 
 	running, err := p.tasks.ListRunning(ctx)
@@ -157,22 +158,26 @@ func (p *PollService) buildResponse(ctx context.Context, taskID string, dev *mod
 	t, err := p.tasks.Get(ctx, taskID)
 	if err != nil {
 		if errors.Is(err, model.ErrTaskNotFound) {
-			return nil, err
+			// 任务已不存在（被清理/脏 taskID）：绝不 panic，优雅降级返回不升级。
+			return &model.PollUpgradeResponse{NeedUpgrade: false, Message: "task not found"}, nil
 		}
 		return nil, err
 	}
-	var fw *model.Firmware
-	var ferr error
-	if t != nil {
-		fw, ferr = p.firmwares.Get(ctx, t.FirmwareID)
-	} else {
-		fw, ferr = p.firmwares.Get(ctx, t.FirmwareID)
+	// task store 对空 id 或缺失记录返回 (nil, nil)，这里统一兜底，避免后续对 t 解引用 panic。
+	if t == nil {
+		return &model.PollUpgradeResponse{NeedUpgrade: false, Message: "task not found"}, nil
 	}
+	fw, ferr := p.firmwares.Get(ctx, t.FirmwareID)
 	if ferr != nil {
 		if errors.Is(ferr, model.ErrFirmwareNotFound) {
-			return nil, ferr
+			// 固件被删除等导致缺失：优雅降级，不 panic。
+			return &model.PollUpgradeResponse{NeedUpgrade: false, Message: "firmware not found"}, nil
 		}
 		return nil, ferr
+	}
+	// fw 理论上非空（命中则返回拷贝指针），防御性兜底。
+	if fw == nil {
+		return &model.PollUpgradeResponse{NeedUpgrade: false, Message: "firmware not found"}, nil
 	}
 	downloadURL := "/api/v1/firmwares/" + fw.ID + "/download"
 	timeoutSec := t.TimeoutSeconds
@@ -186,12 +191,7 @@ func (p *PollService) buildResponse(ctx context.Context, taskID string, dev *mod
 		modelHint = t.ModelID
 	}
 	_ = modelHint
-	var sizeGuard int64
-	if fw != nil {
-		sizeGuard = fw.Size
-	} else {
-		sizeGuard = 0
-	}
+	sizeGuard := fw.Size
 	return &model.PollUpgradeResponse{
 		NeedUpgrade:   true,
 		TaskID:        t.ID,
