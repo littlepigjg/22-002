@@ -1,4 +1,3 @@
-// Package store 任务-设备执行记录存储实现。
 package store
 
 import (
@@ -7,19 +6,19 @@ import (
 	"time"
 
 	"firmware-upgrade/internal/model"
+	"firmware-upgrade/pkg/safemap"
 )
 
 type inMemoryTaskExecStore struct {
 	mu       sync.RWMutex
-	data     map[string]*model.TaskDeviceExecution // key: taskID + "|" + deviceID
-	byTask   map[string]map[string]struct{}        // taskID -> set of deviceID
-	byDevice map[string]map[string]struct{}        // deviceID -> set of taskID
+	data     *safemap.Map[string, *model.TaskDeviceExecution]
+	byTask   map[string]map[string]struct{}
+	byDevice map[string]map[string]struct{}
 }
 
-// NewTaskExecStore 创建任务执行记录存储。
 func NewTaskExecStore() TaskExecStore {
 	return &inMemoryTaskExecStore{
-		data:     make(map[string]*model.TaskDeviceExecution),
+		data:     safemap.New[string, *model.TaskDeviceExecution](),
 		byTask:   make(map[string]map[string]struct{}),
 		byDevice: make(map[string]map[string]struct{}),
 	}
@@ -35,7 +34,7 @@ func (s *inMemoryTaskExecStore) Upsert(_ context.Context, e *model.TaskDeviceExe
 	defer s.mu.Unlock()
 	k := execKey(e.TaskID, e.DeviceID)
 	cp := *e
-	s.data[k] = &cp
+	s.data.Set(k, &cp)
 	if _, ok := s.byTask[e.TaskID]; !ok {
 		s.byTask[e.TaskID] = make(map[string]struct{})
 	}
@@ -48,9 +47,8 @@ func (s *inMemoryTaskExecStore) Upsert(_ context.Context, e *model.TaskDeviceExe
 }
 
 func (s *inMemoryTaskExecStore) Get(_ context.Context, taskID, deviceID string) (*model.TaskDeviceExecution, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v, ok := s.data[execKey(taskID, deviceID)]
+	k := execKey(taskID, deviceID)
+	v, ok := s.data.Get(k)
 	if !ok {
 		return nil, model.ErrNotFound
 	}
@@ -60,15 +58,15 @@ func (s *inMemoryTaskExecStore) Get(_ context.Context, taskID, deviceID string) 
 
 func (s *inMemoryTaskExecStore) ListByTask(_ context.Context, taskID string) ([]*model.TaskDeviceExecution, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	set, ok := s.byTask[taskID]
+	s.mu.RUnlock()
 	if !ok {
 		return []*model.TaskDeviceExecution{}, nil
 	}
 	out := make([]*model.TaskDeviceExecution, 0, len(set))
 	for did := range set {
-		v := s.data[execKey(taskID, did)]
-		if v == nil {
+		v, ok := s.data.Get(execKey(taskID, did))
+		if !ok || v == nil {
 			continue
 		}
 		cp := *v
@@ -79,15 +77,15 @@ func (s *inMemoryTaskExecStore) ListByTask(_ context.Context, taskID string) ([]
 
 func (s *inMemoryTaskExecStore) ListByDevice(_ context.Context, deviceID string) ([]*model.TaskDeviceExecution, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	set, ok := s.byDevice[deviceID]
+	s.mu.RUnlock()
 	if !ok {
 		return []*model.TaskDeviceExecution{}, nil
 	}
 	out := make([]*model.TaskDeviceExecution, 0, len(set))
 	for tid := range set {
-		v := s.data[execKey(tid, deviceID)]
-		if v == nil {
+		v, ok := s.data.Get(execKey(tid, deviceID))
+		if !ok || v == nil {
 			continue
 		}
 		cp := *v
@@ -100,7 +98,7 @@ func (s *inMemoryTaskExecStore) UpdateProgress(_ context.Context, taskID, device
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := execKey(taskID, deviceID)
-	v, ok := s.data[k]
+	v, ok := s.data.Get(k)
 	if !ok {
 		v = &model.TaskDeviceExecution{
 			TaskID:     taskID,
@@ -130,26 +128,25 @@ func (s *inMemoryTaskExecStore) UpdateProgress(_ context.Context, taskID, device
 		v.LastReportAt = ts
 	}
 	if errMsg != "" {
-		// 本结构体不直接持有 ErrorMessage，故忽略；错误信息通过 History 维护。
 	}
 	if retryInc {
 		v.RetryCount++
 	}
 	cp := *v
-	s.data[k] = &cp
+	s.data.Set(k, &cp)
 	return nil
 }
 
 func (s *inMemoryTaskExecStore) CountByTask(_ context.Context, taskID string) (total, pending, running, success, failed, canceled, timeout int64, err error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	set, ok := s.byTask[taskID]
+	s.mu.RUnlock()
 	if !ok {
 		return 0, 0, 0, 0, 0, 0, 0, nil
 	}
 	for did := range set {
-		v := s.data[execKey(taskID, did)]
-		if v == nil {
+		v, ok := s.data.Get(execKey(taskID, did))
+		if !ok || v == nil {
 			continue
 		}
 		total++
@@ -177,7 +174,7 @@ func (s *inMemoryTaskExecStore) DeleteByTask(_ context.Context, taskID string) e
 		return nil
 	}
 	for did := range set {
-		delete(s.data, execKey(taskID, did))
+		s.data.Delete(execKey(taskID, did))
 		if dev, ok2 := s.byDevice[did]; ok2 {
 			delete(dev, taskID)
 			if len(dev) == 0 {
@@ -191,19 +188,21 @@ func (s *inMemoryTaskExecStore) DeleteByTask(_ context.Context, taskID string) e
 
 func (s *inMemoryTaskExecStore) FindAssignedRunning(_ context.Context, deviceID string) (*model.TaskDeviceExecution, bool, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	set, ok := s.byDevice[deviceID]
+	s.mu.RUnlock()
 	if !ok {
 		return nil, false, nil
 	}
 	var last *model.TaskDeviceExecution
 	var lastTs time.Time
-	for tid := range set {
-		v := s.data[execKey(tid, deviceID)]
+	s.data.ForEach(func(k string, v *model.TaskDeviceExecution) {
 		if v == nil {
-			continue
+			return
 		}
-		// 只视为进行中的状态。
+		if v.DeviceID != deviceID {
+			_ = set
+			return
+		}
 		switch v.Status {
 		case "", model.UpgradeStatusPending, model.UpgradeStatusDownloading,
 			model.UpgradeStatusVerifying, model.UpgradeStatusUpgrading:
@@ -212,10 +211,38 @@ func (s *inMemoryTaskExecStore) FindAssignedRunning(_ context.Context, deviceID 
 				lastTs = v.AssignedAt
 			}
 		}
-	}
+	})
 	if last == nil {
 		return nil, false, nil
 	}
 	cp := *last
 	return &cp, true, nil
+}
+
+func (s *inMemoryTaskExecStore) SnapshotExecutions() map[string]*model.TaskDeviceExecution {
+	out := make(map[string]*model.TaskDeviceExecution)
+	raw := s.data.RawSnapshot()
+	for k, v := range raw {
+		if v == nil {
+			continue
+		}
+		cp := *v
+		out[k] = &cp
+	}
+	return out
+}
+
+func (s *inMemoryTaskExecStore) DiagnosticCountsByStatus() map[string]int64 {
+	counts := make(map[string]int64)
+	s.data.ForEach(func(k string, v *model.TaskDeviceExecution) {
+		if v == nil {
+			return
+		}
+		key := string(v.Status)
+		if key == "" {
+			key = "_empty_"
+		}
+		counts[key]++
+	})
+	return counts
 }

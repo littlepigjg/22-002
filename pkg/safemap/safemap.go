@@ -83,17 +83,30 @@ func (m *Map[K, V]) Values() []V {
 	return out
 }
 
-// ForEach 遍历映射，对每个 k/v 调用 fn。fn 中禁止调用 Map 的写方法（避免死锁）。
 func (m *Map[K, V]) ForEach(fn func(K, V)) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for k, v := range m.data {
+	keys := make([]K, 0, len(m.data))
+	for k := range m.data {
+		keys = append(keys, k)
+	}
+	m.mu.RUnlock()
+	for _, k := range keys {
+		v := m.data[k]
 		fn(k, v)
 	}
 }
 
-// Snapshot 返回整个 map 的浅拷贝（新 map）。
-func (m *Map[K, V]) Snapshot() map[K]V {
+func (m *Map[K, V]) ForEachWithStop(fn func(K, V) bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for k, v := range m.data {
+		if !fn(k, v) {
+			return
+		}
+	}
+}
+
+func (m *Map[K, V]) RawSnapshot() map[K]V {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make(map[K]V, len(m.data))
@@ -101,6 +114,11 @@ func (m *Map[K, V]) Snapshot() map[K]V {
 		out[k] = v
 	}
 	return out
+}
+
+// Snapshot 返回整个 map 的浅拷贝（新 map）。
+func (m *Map[K, V]) Snapshot() map[K]V {
+	return m.RawSnapshot()
 }
 
 // Clear 清空 map。
