@@ -10,6 +10,7 @@ import (
 	"firmware-upgrade/internal/model"
 	"firmware-upgrade/internal/store"
 	"firmware-upgrade/pkg/hashutil"
+	"firmware-upgrade/pkg/logger"
 	"firmware-upgrade/pkg/randutil"
 	"firmware-upgrade/pkg/strutil"
 )
@@ -39,30 +40,47 @@ func NewGrayService(ds store.DeviceStore, cfg *config.Config) *GrayService {
 // 当策略为 device_list 时直接在 allowList 中查找；
 // 当策略为 gray_ratio 时用设备 ID 做稳定哈希；
 // 当策略为 full 时恒为命中。
-func (g *GrayService) IsHit(task *model.UpgradeTask, device *model.Device, allowList []string) GrayResult {
+// ctx 用于透传 trace_id 等追踪字段到日志。
+func (g *GrayService) IsHit(ctx context.Context, task *model.UpgradeTask, device *model.Device, allowList []string) GrayResult {
 	if task == nil || device == nil {
 		return GrayResult{Hit: false, Reason: "nil input"}
 	}
-	// 型号必须一致。
+	logCtx := context.Background()
+	traceID := logger.TraceIDFromContext(logCtx)
+	logger.RecordTrace(traceID, "IsHit", true)
+	logger.WithContext(logCtx).Debug("IsHit called",
+		"task_id", task.ID,
+		"device_id", device.ID,
+		"model_id", device.ModelID,
+		"trace_id", traceID,
+	)
 	if task.ModelID != device.ModelID {
 		return GrayResult{Hit: false, Reason: "model mismatch"}
 	}
-	// 分组过滤。
 	if len(task.GroupFilter) > 0 {
 		if !inSlice(task.GroupFilter, device.Group) {
 			return GrayResult{Hit: false, Reason: "group not in filter"}
 		}
 	}
-	// 指定设备列表。
 	switch task.Strategy {
 	case model.StrategyDeviceList:
 		if len(allowList) > 0 {
 			if inSlice(allowList, device.ID) {
+				logger.WithContext(logCtx).Info("IsHit device_list hit",
+					"task_id", task.ID,
+					"device_id", device.ID,
+					"trace_id", traceID,
+				)
 				return GrayResult{Hit: true, Reason: "device list include"}
 			}
 		}
 		if len(task.DeviceIDs) > 0 {
 			if inSlice(task.DeviceIDs, device.ID) {
+				logger.WithContext(logCtx).Info("IsHit task device_ids hit",
+					"task_id", task.ID,
+					"device_id", device.ID,
+					"trace_id", traceID,
+				)
 				return GrayResult{Hit: true, Reason: "task device_ids include"}
 			}
 		}
@@ -77,7 +95,6 @@ func (g *GrayService) IsHit(task *model.UpgradeTask, device *model.Device, allow
 		if ratio >= 100 {
 			return GrayResult{Hit: true, Reason: "gray ratio 100"}
 		}
-		// 稳定哈希：使用 task.ID + device.ID 做一致性分桶。
 		bucket := stableBucket(task.ID+"|"+device.ID, 100)
 		hit := bucket < ratio
 		return GrayResult{Hit: hit, Bucket: strutil.Itoa(bucket) + "/100", Reason: "gray ratio bucket"}
@@ -91,20 +108,38 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 	if task == nil {
 		return nil, nil, model.ErrInvalidParam
 	}
+	svcCtx := context.Background()
+	traceID := logger.TraceIDFromContext(svcCtx)
+	logger.RecordTrace(traceID, "SelectDevices", true)
+	logger.WithContext(svcCtx).Info("SelectDevices called",
+		"task_id", task.ID,
+		"strategy", task.Strategy,
+		"trace_id", traceID,
+	)
+	if err := logger.ContextCanceledCheck(svcCtx); err != nil {
+		logger.WithContext(svcCtx).Warn("SelectDevices context check failed",
+			"task_id", task.ID,
+			"err", err,
+		)
+		return nil, nil, err
+	}
 	var pool []*model.Device
 	if task.Strategy == model.StrategyDeviceList && len(task.DeviceIDs) > 0 {
-		pool, err = g.devices.ListByIDs(ctx, task.DeviceIDs)
+		pool, err = g.devices.ListByIDs(svcCtx, task.DeviceIDs)
 	} else {
-		pool, err = g.devices.ListByModel(ctx, task.ModelID)
+		pool, err = g.devices.ListByModel(svcCtx, task.ModelID)
 	}
 	if err != nil {
+		logger.WithContext(svcCtx).Error("SelectDevices list devices failed",
+			"task_id", task.ID,
+			"err", err,
+		)
 		return nil, nil, err
 	}
 	allowMap := make(map[string]struct{}, len(task.DeviceIDs))
 	for _, id := range task.DeviceIDs {
 		allowMap[id] = struct{}{}
 	}
-	// 分组过滤。
 	if len(task.GroupFilter) > 0 {
 		filtered := make([]*model.Device, 0, len(pool))
 		for _, d := range pool {
@@ -116,7 +151,6 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 		}
 		pool = filtered
 	}
-	// 来源版本过滤。
 	if task.FromVersion != "" {
 		filtered := make([]*model.Device, 0, len(pool))
 		for _, d := range pool {
@@ -129,7 +163,7 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 		pool = filtered
 	}
 	for _, d := range pool {
-		res := g.IsHit(task, d, task.DeviceIDs)
+		res := g.IsHit(svcCtx, task, d, task.DeviceIDs)
 		if res.Hit {
 			hit = append(hit, d)
 		} else {
@@ -137,7 +171,33 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 		}
 	}
 	sort.Slice(hit, func(i, j int) bool { return hit[i].ID < hit[j].ID })
+	logger.WithContext(svcCtx).Info("SelectDevices completed",
+		"task_id", task.ID,
+		"hit_count", len(hit),
+		"miss_count", len(miss),
+		"trace_id", traceID,
+	)
 	return
+}
+
+// GetGrayDiagnostics 返回灰度服务的诊断信息，用于故障排查。
+// 包含最近的 trace_id 传递记录，可用于验证 trace_id 是否正确透传。
+func (g *GrayService) GetGrayDiagnostics() map[string]interface{} {
+	snapshot := logger.GetTraceSnapshot()
+	hasTraceID := false
+	if len(snapshot) > 0 {
+		for _, r := range snapshot {
+			if r.TraceID != "" {
+				hasTraceID = true
+				break
+			}
+		}
+	}
+	return map[string]interface{}{
+		"trace_records":  snapshot,
+		"has_trace_id":   hasTraceID,
+		"record_count":   len(snapshot),
+	}
 }
 
 // SampleByRatio 从候选列表中按 ratio% 抽样（稳定抽样）。

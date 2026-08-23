@@ -6,13 +6,16 @@
 #     1. builder —— 拉取 Go 1.22 基础镜像，构建静态二进制。
 #     2. runner  —— 基于 slim + ca-certificates/tzdata 运行。
 #
-#   产物路径：/app/server、/app/web、/app/data
+#   产物路径：/app/server、/app/data
 #   对外端口：EXPOSE 8080
-#   健康检查：/health/live + /health/ready
+#   健康检查：/health
 
 # 1) 构建镜像 -----------------------------------------------------------
 ARG GO_VERSION=1.22
 ARG ALPINE_VERSION=3.20
+
+# 支持多架构构建，通过 buildx 的 TARGETARCH 自动推断
+ARG TARGETARCH=amd64
 
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 
@@ -20,13 +23,15 @@ FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG GOSUMDB=sum.golang.org
 ARG CGO_ENABLED=0
+ARG TARGETARCH=amd64
 
+# Go 架构映射：docker buildx 的 TARGETARCH (amd64/arm64) 对应 Go 的 GOARCH
 ENV GOPROXY=${GOPROXY} \
     GOSUMDB=${GOSUMDB} \
     CGO_ENABLED=${CGO_ENABLED} \
     GO111MODULE=on \
     GOOS=linux \
-    GOARCH=amd64
+    GOARCH=${TARGETARCH}
 
 WORKDIR /src
 
@@ -59,7 +64,7 @@ ARG APP_GID=10001
 RUN apk add --no-cache ca-certificates tzdata curl \
     && addgroup -g ${APP_GID} -S appgroup \
     && adduser  -u ${APP_UID} -S appuser -G appgroup -h /app -s /sbin/nologin \
-    && mkdir -p /app/data/firmwares /app/data/uploads /app/web \
+    && mkdir -p /app/data/firmwares /app/data/uploads \
     && chown -R ${APP_UID}:${APP_GID} /app \
     && rm -rf /var/cache/apk/* /tmp/*
 
@@ -79,9 +84,6 @@ WORKDIR /app
 # 二进制
 COPY --from=builder /out/server /app/server
 
-# 前端静态资源目录（若构建时已内嵌 go:embed 则无需复制；这里也保留显式目录兜底）
-COPY web /app/web
-
 # 运行用户与暴露端口
 USER ${APP_UID}:${APP_GID}
 EXPOSE 8080/tcp
@@ -91,7 +93,7 @@ VOLUME [ "/app/data" ]
 
 # 健康检查（5s 宽限、10s 间隔、3 次失败算不健康）
 HEALTHCHECK --start-period=5s --interval=10s --timeout=3s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/health/live || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 
 STOPSIGNAL SIGTERM
 

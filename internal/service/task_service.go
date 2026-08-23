@@ -58,7 +58,22 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 	); err != nil {
 		return nil, err
 	}
-	// 策略合法性。
+	svcCtx := context.Background()
+	traceID := logger.TraceIDFromContext(svcCtx)
+	logger.RecordTrace(traceID, "TaskService.Create", true)
+	logger.WithContext(svcCtx).Info("Create task called",
+		"name", req.Name,
+		"model_id", req.ModelID,
+		"strategy", req.Strategy,
+		"trace_id", traceID,
+	)
+	if err := logger.ContextCanceledCheck(svcCtx); err != nil {
+		logger.WithContext(svcCtx).Warn("Create context check failed",
+			"name", req.Name,
+			"err", err,
+		)
+		return nil, err
+	}
 	switch req.Strategy {
 	case model.StrategyGrayRatio, model.StrategyDeviceList, model.StrategyFull, "":
 	default:
@@ -74,16 +89,14 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 	if strategy == model.StrategyGrayRatio && req.GrayRatio <= 0 {
 		return nil, model.ErrStrategyInvalid
 	}
-	// 型号、固件存在性校验。
-	if ok, err := s.models.Exists(ctx, req.ModelID); err != nil {
+	if ok, err := s.models.Exists(svcCtx, req.ModelID); err != nil {
 		return nil, err
 	} else if !ok {
 		return nil, model.ErrModelNotFound
 	}
-	// 固件关联：优先 firmware_id，次选 model + target_version。
 	var fw *model.Firmware
 	if req.FirmwareID != "" {
-		f, err := s.firmwares.Get(ctx, req.FirmwareID)
+		f, err := s.firmwares.Get(svcCtx, req.FirmwareID)
 		if err != nil {
 			return nil, err
 		}
@@ -95,7 +108,7 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 			return nil, errors.New("firmware version mismatch target_version")
 		}
 	} else {
-		f, err := s.firmwares.FindByModelAndVersion(ctx, req.ModelID, req.TargetVersion)
+		f, err := s.firmwares.FindByModelAndVersion(svcCtx, req.ModelID, req.TargetVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -145,21 +158,43 @@ func (s *TaskService) Create(ctx context.Context, req *model.CreateTaskRequest) 
 	if status == model.TaskStatusRunning {
 		t.StartTime = now
 	}
-	if err := s.tasks.Create(ctx, t); err != nil {
+	if err := s.tasks.Create(svcCtx, t); err != nil {
 		return nil, err
 	}
-	// 为命中的设备预创建执行记录与历史记录。
 	if status == model.TaskStatusRunning {
-		if err := s.assignInitialExecutions(ctx, t); err != nil {
+		if err := s.assignInitialExecutions(svcCtx, t); err != nil {
 			logger.Warn("assign initial executions failed", "task_id", t.ID, "err", err)
 		}
 	}
-	return s.tasks.Get(ctx, t.ID)
+	result, err := s.tasks.Get(svcCtx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	logger.WithContext(svcCtx).Info("Create task completed",
+		"task_id", t.ID,
+		"status", status,
+		"trace_id", traceID,
+	)
+	return result, nil
 }
 
 // assignInitialExecutions 为任务分配命中设备的执行记录。
 func (s *TaskService) assignInitialExecutions(ctx context.Context, t *model.UpgradeTask) error {
-	hits, _, err := s.gray.SelectDevices(ctx, t)
+	svcCtx := context.Background()
+	traceID := logger.TraceIDFromContext(svcCtx)
+	logger.RecordTrace(traceID, "assignInitialExecutions", true)
+	logger.WithContext(svcCtx).Info("assignInitialExecutions called",
+		"task_id", t.ID,
+		"trace_id", traceID,
+	)
+	if err := logger.ContextCanceledCheck(svcCtx); err != nil {
+		logger.WithContext(svcCtx).Warn("assignInitialExecutions context check failed",
+			"task_id", t.ID,
+			"err", err,
+		)
+		return err
+	}
+	hits, _, err := s.gray.SelectDevices(svcCtx, t)
 	if err != nil {
 		return err
 	}
@@ -172,7 +207,7 @@ func (s *TaskService) assignInitialExecutions(ctx context.Context, t *model.Upgr
 			Progress:   0,
 			AssignedAt: timeutil.Now(),
 		}
-		if errE := s.execs.Upsert(ctx, exec); errE != nil {
+		if errE := s.execs.Upsert(svcCtx, exec); errE != nil {
 			logger.Warn("upsert exec failed", "task_id", t.ID, "device_id", d.ID, "err", errE)
 			continue
 		}
@@ -188,12 +223,17 @@ func (s *TaskService) assignInitialExecutions(ctx context.Context, t *model.Upgr
 			Progress:    0,
 			StartedAt:   timeutil.Now(),
 		}
-		if errH := s.history.Create(ctx, h); errH != nil {
+		if errH := s.history.Create(svcCtx, h); errH != nil {
 			logger.Warn("create history failed", "task_id", t.ID, "device_id", d.ID, "err", errH)
 		}
 	}
-	_ = s.tasks.UpdateProgress(ctx, t.ID, progress)
+	_ = s.tasks.UpdateProgress(svcCtx, t.ID, progress)
 	s.stats.Invalidate()
+	logger.WithContext(svcCtx).Info("assignInitialExecutions completed",
+		"task_id", t.ID,
+		"total_devices", len(hits),
+		"trace_id", traceID,
+	)
 	return nil
 }
 

@@ -95,7 +95,18 @@ func (s *inMemoryDeviceStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-func (s *inMemoryDeviceStore) List(_ context.Context, keyword, modelID, group, status, version, tag string, offlineBefore int64, pageNum, pageSize int) ([]*model.Device, int64, error) {
+func (s *inMemoryDeviceStore) List(ctx context.Context, keyword, modelID, group, status, version, tag string, offlineBefore int64, pageNum, pageSize int) ([]*model.Device, int64, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err == context.Canceled {
+				return nil, 0, model.ErrContextCanceled
+			}
+			return nil, 0, err
+		default:
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var ob time.Time
@@ -132,7 +143,18 @@ func (s *inMemoryDeviceStore) List(_ context.Context, keyword, modelID, group, s
 	return paginateD(all, pageNum, pageSize)
 }
 
-func (s *inMemoryDeviceStore) ListByModel(_ context.Context, modelID string) ([]*model.Device, error) {
+func (s *inMemoryDeviceStore) ListByModel(ctx context.Context, modelID string) ([]*model.Device, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err == context.Canceled {
+				return nil, model.ErrContextCanceled
+			}
+			return nil, err
+		default:
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*model.Device, 0)
@@ -146,7 +168,18 @@ func (s *inMemoryDeviceStore) ListByModel(_ context.Context, modelID string) ([]
 	return out, nil
 }
 
-func (s *inMemoryDeviceStore) ListByIDs(_ context.Context, ids []string) ([]*model.Device, error) {
+func (s *inMemoryDeviceStore) ListByIDs(ctx context.Context, ids []string) ([]*model.Device, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err == context.Canceled {
+				return nil, model.ErrContextCanceled
+			}
+			return nil, err
+		default:
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*model.Device, 0, len(ids))

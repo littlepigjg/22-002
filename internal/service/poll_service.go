@@ -87,7 +87,7 @@ func (p *PollService) Poll(ctx context.Context, req *model.PollUpgradeRequest) (
 			continue
 		}
 		// 灰度命中。
-		res := p.gray.IsHit(t, dev, t.DeviceIDs)
+		res := p.gray.IsHit(ctx, t, dev, t.DeviceIDs)
 		if !res.Hit {
 			continue
 		}

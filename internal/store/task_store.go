@@ -45,9 +45,20 @@ func (s *inMemoryTaskStore) Create(_ context.Context, t *model.UpgradeTask) erro
 	return nil
 }
 
-func (s *inMemoryTaskStore) Update(_ context.Context, t *model.UpgradeTask) error {
+func (s *inMemoryTaskStore) Update(ctx context.Context, t *model.UpgradeTask) error {
 	if t == nil {
 		return model.ErrInvalidParam
+	}
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err == context.Canceled {
+				return model.ErrContextCanceled
+			}
+			return err
+		default:
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -66,7 +77,18 @@ func (s *inMemoryTaskStore) Update(_ context.Context, t *model.UpgradeTask) erro
 	return nil
 }
 
-func (s *inMemoryTaskStore) Get(_ context.Context, id string) (*model.UpgradeTask, error) {
+func (s *inMemoryTaskStore) Get(ctx context.Context, id string) (*model.UpgradeTask, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err == context.Canceled {
+				return nil, model.ErrContextCanceled
+			}
+			return nil, err
+		default:
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.data[id]

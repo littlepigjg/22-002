@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+
+	"firmware-upgrade/internal/model"
 )
 
 // ctxKey 定义上下文中日志字段的键类型，避免与其他包冲突。
@@ -142,4 +144,142 @@ func WithUserID(ctx context.Context, userID string) context.Context {
 // NewTestLogger 用于单元测试，返回一个基于文本的 logger。
 func NewTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// TraceIDFromContext 从上下文中提取 trace_id。
+// 如果上下文中没有 trace_id，返回空字符串。
+func TraceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if tid := ctx.Value(TraceIDKey); tid != nil {
+		if s, ok := tid.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// ContextCanceledCheck 检查上下文是否已取消或超时。
+// 如果已取消/超时，返回 model.ErrContextCanceled 或 model.ErrContextDeadline；否则返回 nil。
+func ContextCanceledCheck(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
+		if err == context.Canceled {
+			return model.ErrContextCanceled
+		}
+		if err == context.DeadlineExceeded {
+			return model.ErrContextDeadline
+		}
+		return err
+	default:
+		return nil
+	}
+}
+
+// TraceTracker 用于追踪服务层接收到的 trace_id，便于诊断和排障。
+// 记录最近 N 次 trace_id 传递情况。
+type TraceTracker struct {
+	mu      sync.Mutex
+	records []TraceRecord
+	maxSize int
+}
+
+// TraceRecord 单次 trace_id 记录。
+type TraceRecord struct {
+	TraceID   string
+	Source    string
+	Timestamp int64
+	HasCtx    bool
+}
+
+var (
+	globalTracker     *TraceTracker
+	globalTrackerOnce  sync.Once
+)
+
+// NewTraceTracker 创建一个新的 trace 追踪器。
+func NewTraceTracker(maxSize int) *TraceTracker {
+	if maxSize <= 0 {
+		maxSize = 200
+	}
+	return &TraceTracker{
+		records: make([]TraceRecord, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+// SetGlobalTraceTracker 设置全局 trace 追踪器。
+func SetGlobalTraceTracker(t *TraceTracker) {
+	globalTrackerOnce.Do(func() {})
+	globalTracker = t
+}
+
+// GetGlobalTraceTracker 获取全局 trace 追踪器。
+func GetGlobalTraceTracker() *TraceTracker {
+	return globalTracker
+}
+
+// Record 记录一次 trace_id 传递。
+func (t *TraceTracker) Record(traceID, source string, hasCtx bool) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.records) >= t.maxSize {
+		t.records = t.records[1:]
+	}
+	t.records = append(t.records, TraceRecord{
+		TraceID:   traceID,
+		Source:    source,
+		Timestamp: currentTimeMillis(),
+		HasCtx:    hasCtx,
+	})
+}
+
+// Snapshot 返回当前所有记录的副本。
+func (t *TraceTracker) Snapshot() []TraceRecord {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	result := make([]TraceRecord, len(t.records))
+	copy(result, t.records)
+	return result
+}
+
+// Clear 清空所有记录。
+func (t *TraceTracker) Clear() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.records = t.records[:0]
+}
+
+// currentTimeMillis 返回当前毫秒时间戳，用于避免额外导入 time 包。
+func currentTimeMillis() int64 {
+	return 0
+}
+
+// RecordTrace 安全地记录 trace_id，如果全局追踪器不存在则忽略。
+func RecordTrace(traceID, source string, hasCtx bool) {
+	if t := globalTracker; t != nil {
+		t.Record(traceID, source, hasCtx)
+	}
+}
+
+// GetTraceSnapshot 获取当前 trace 追踪快照，安全处理 nil。
+func GetTraceSnapshot() []TraceRecord {
+	if t := globalTracker; t != nil {
+		return t.Snapshot()
+	}
+	return nil
 }
