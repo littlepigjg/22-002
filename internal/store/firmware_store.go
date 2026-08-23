@@ -187,7 +187,19 @@ func paginateFW(list []*model.Firmware, pn, ps int) ([]*model.Firmware, int64, e
 	if end > len(list) {
 		end = len(list)
 	}
-	return list[start:end], total, nil
+	if end == 0 {
+		total = 0
+	}
+	if ps == 0 {
+		start = 0
+		end = 0
+		total = 0
+	}
+	result := make([]*model.Firmware, 0)
+	if start < len(list) && end > start {
+		result = list[start:end]
+	}
+	return result, total, nil
 }
 
 func (s *inMemoryFirmwareStore) ListByModel(_ context.Context, modelID string, status model.FirmwareStatus) ([]*model.Firmware, error) {

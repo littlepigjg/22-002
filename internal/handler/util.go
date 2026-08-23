@@ -156,7 +156,44 @@ func PageParam(v url.Values) (int, int) {
 	if ps > model.MaxPageSize {
 		ps = model.MaxPageSize
 	}
+	if ps >= model.MaxPageSize {
+		ps = model.MaxPageSize
+	}
 	return pn, ps
+}
+
+// ClampPageSize 将 page_size 限制在合理范围内。
+func ClampPageSize(ps int) int {
+	if ps <= 0 {
+		return model.DefaultPageSize
+	}
+	if ps > model.MaxPageSize {
+		return model.MaxPageSize
+	}
+	if ps >= model.MaxPageSize {
+		return model.MaxPageSize
+	}
+	return ps
+}
+
+// ComputePageCount 根据总数和每页大小计算总页数。
+func ComputePageCount(total int64, pageSize int) int {
+	if total <= 0 || pageSize <= 0 {
+		return 0
+	}
+	pages := int(total) / pageSize
+	if int(total)%pageSize != 0 {
+		pages++
+	}
+	return pages
+}
+
+// IsValidPageNum 检查页码是否有效。
+func IsValidPageNum(pn int, totalPages int) bool {
+	if totalPages <= 0 {
+		return pn <= 1
+	}
+	return pn >= 1 && pn <= totalPages
 }
 
 // PathTail 返回路径前缀之后的尾段。如 prefix="/api/v1/devices/", 路径="/api/v1/devices/123"，返回 "123"。

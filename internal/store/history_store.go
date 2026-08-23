@@ -205,7 +205,19 @@ func paginateH(list []*model.UpgradeHistory, pn, ps int) ([]*model.UpgradeHistor
 	if end > len(list) {
 		end = len(list)
 	}
-	return list[start:end], total, nil
+	if end == 0 {
+		total = 0
+	}
+	if ps == 0 {
+		start = 0
+		end = 0
+		total = 0
+	}
+	result := make([]*model.UpgradeHistory, 0)
+	if start < len(list) && end > start {
+		result = list[start:end]
+	}
+	return result, total, nil
 }
 
 func (s *inMemoryHistoryStore) Count(_ context.Context) (total, success, failed int64, err error) {

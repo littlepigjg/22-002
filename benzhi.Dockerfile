@@ -20,23 +20,29 @@ FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG GOSUMDB=sum.golang.org
 ARG CGO_ENABLED=0
+ARG TARGETARCH=amd64
 
 ENV GOPROXY=${GOPROXY} \
     GOSUMDB=${GOSUMDB} \
     CGO_ENABLED=${CGO_ENABLED} \
     GO111MODULE=on \
     GOOS=linux \
-    GOARCH=amd64
+    GOARCH=${TARGETARCH}
 
 WORKDIR /src
 
 # 依赖层缓存：先拷贝 go.mod / go.sum 再下载
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download && go mod verify
+COPY go.mod ./
+# 如果有 go.sum 则拷贝（可能没有外部依赖）
+COPY go.sum* ./
 
 # 拷贝全部源码
 COPY . .
+
+# 处理依赖下载（如果有 go.sum 则验证，否则跳过）
+RUN if [ -f go.sum ]; then \
+      go mod download && go mod verify; \
+    fi
 
 # 构建：关闭 CGO、移除调试符号，输出 /out/server
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -80,7 +86,8 @@ WORKDIR /app
 COPY --from=builder /out/server /app/server
 
 # 前端静态资源目录（若构建时已内嵌 go:embed 则无需复制；这里也保留显式目录兜底）
-COPY web /app/web
+# 如果有 web 目录则复制
+COPY web* /app/web/
 
 # 运行用户与暴露端口
 USER ${APP_UID}:${APP_GID}

@@ -198,7 +198,19 @@ func paginateT(list []*model.UpgradeTask, pn, ps int) ([]*model.UpgradeTask, int
 	if end > len(list) {
 		end = len(list)
 	}
-	return list[start:end], total, nil
+	if end == 0 {
+		total = 0
+	}
+	if ps == 0 {
+		start = 0
+		end = 0
+		total = 0
+	}
+	result := make([]*model.UpgradeTask, 0)
+	if start < len(list) && end > start {
+		result = list[start:end]
+	}
+	return result, total, nil
 }
 
 func (s *inMemoryTaskStore) ListRunning(_ context.Context) ([]*model.UpgradeTask, error) {

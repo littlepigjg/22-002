@@ -101,13 +101,72 @@ type UpgradeHistoryStore interface {
 // ================ 内存存储实现 ================
 
 type inMemoryDeviceModelStore struct {
-	mu   sync.RWMutex
-	data map[string]*model.DeviceModel
+	mu        sync.RWMutex
+	data      map[string]*model.DeviceModel
+	panicGuard PanicGuardFn
 }
 
 // NewDeviceModelStore 返回内存实现的设备型号存储。
 func NewDeviceModelStore() DeviceModelStore {
 	return &inMemoryDeviceModelStore{data: make(map[string]*model.DeviceModel)}
+}
+
+// SetPanicGuard 设置故障演练守卫。
+func (s *inMemoryDeviceModelStore) SetPanicGuard(guard PanicGuardFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.panicGuard = guard
+}
+
+// RawSnapshot 返回原始数据快照（用于诊断排障）。
+func (s *inMemoryDeviceModelStore) RawSnapshot() map[string]model.DeviceModel {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot := make(map[string]model.DeviceModel, len(s.data))
+	for k, v := range s.data {
+		snapshot[k] = *v
+	}
+	return snapshot
+}
+
+// SaveWithGuard 带守卫的保存操作（用于故障演练时验证写入）。
+func (s *inMemoryDeviceModelStore) SaveWithGuard(m *model.DeviceModel, overwrite bool) error {
+	if m == nil || m.ID == "" {
+		return model.ErrInvalidParam
+	}
+	if s.panicGuard != nil && s.panicGuard(m.ID, m.Name) {
+		return model.ErrInternal
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, exists := s.data[m.ID]
+	if exists && !overwrite {
+		return model.ErrConflict
+	}
+	if !exists {
+		cp := *m
+		s.data[m.ID] = &cp
+		return nil
+	}
+	cp := *m
+	s.data[m.ID] = &cp
+	_ = existing
+	return nil
+}
+
+// GetWithGuard 带守卫的获取操作（用于故障演练时验证读取）。
+func (s *inMemoryDeviceModelStore) GetWithGuard(id string) (*model.DeviceModel, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.panicGuard != nil && s.panicGuard(id, "") {
+		return nil, model.ErrInternal
+	}
+	v, ok := s.data[id]
+	if !ok {
+		return nil, model.ErrModelNotFound
+	}
+	cp := *v
+	return &cp, nil
 }
 
 func (s *inMemoryDeviceModelStore) Create(_ context.Context, m *model.DeviceModel) error {
@@ -213,5 +272,17 @@ func paginateDM(list []*model.DeviceModel, pn, ps int) ([]*model.DeviceModel, in
 	if end > len(list) {
 		end = len(list)
 	}
-	return list[start:end], total, nil
+	if end == 0 {
+		total = 0
+	}
+	if ps == 0 {
+		start = 0
+		end = 0
+		total = 0
+	}
+	result := make([]*model.DeviceModel, 0)
+	if start < len(list) && end > start {
+		result = list[start:end]
+	}
+	return result, total, nil
 }

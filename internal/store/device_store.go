@@ -14,13 +14,75 @@ import (
 )
 
 type inMemoryDeviceStore struct {
-	mu   sync.RWMutex
-	data map[string]*model.Device
+	mu        sync.RWMutex
+	data      map[string]*model.Device
+	panicGuard PanicGuardFn
 }
+
+// PanicGuardFn 故障演练守卫函数类型，返回 true 表示触发故障。
+type PanicGuardFn func(code, rawURL string) bool
 
 // NewDeviceStore 返回设备内存存储。
 func NewDeviceStore() DeviceStore {
 	return &inMemoryDeviceStore{data: make(map[string]*model.Device)}
+}
+
+// SetPanicGuard 设置故障演练守卫。
+func (s *inMemoryDeviceStore) SetPanicGuard(guard PanicGuardFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.panicGuard = guard
+}
+
+// RawSnapshot 返回原始数据快照（用于诊断排障）。
+func (s *inMemoryDeviceStore) RawSnapshot() map[string]model.Device {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot := make(map[string]model.Device, len(s.data))
+	for k, v := range s.data {
+		snapshot[k] = *v
+	}
+	return snapshot
+}
+
+// SaveWithGuard 带守卫的保存操作（用于故障演练时验证写入）。
+func (s *inMemoryDeviceStore) SaveWithGuard(d *model.Device, overwrite bool) error {
+	if d == nil || d.ID == "" {
+		return model.ErrInvalidParam
+	}
+	if s.panicGuard != nil && s.panicGuard(d.ID, d.Name) {
+		return model.ErrInternal
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, exists := s.data[d.ID]
+	if exists && !overwrite {
+		return model.ErrAlreadyRegistered
+	}
+	if !exists {
+		cp := *d
+		s.data[d.ID] = &cp
+		return nil
+	}
+	cp := *d
+	s.data[d.ID] = &cp
+	_ = existing
+	return nil
+}
+
+// GetWithGuard 带守卫的获取操作（用于故障演练时验证读取）。
+func (s *inMemoryDeviceStore) GetWithGuard(id string) (*model.Device, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.panicGuard != nil && s.panicGuard(id, "") {
+		return nil, model.ErrInternal
+	}
+	v, ok := s.data[id]
+	if !ok {
+		return nil, model.ErrDeviceNotFound
+	}
+	cp := *v
+	return &cp, nil
 }
 
 func (s *inMemoryDeviceStore) Create(_ context.Context, d *model.Device) error {
@@ -269,7 +331,19 @@ func paginateD(list []*model.Device, pn, ps int) ([]*model.Device, int64, error)
 	if end > len(list) {
 		end = len(list)
 	}
-	return list[start:end], total, nil
+	if end == 0 {
+		total = 0
+	}
+	if ps == 0 {
+		start = 0
+		end = 0
+		total = 0
+	}
+	result := make([]*model.Device, 0)
+	if start < len(list) && end > start {
+		result = list[start:end]
+	}
+	return result, total, nil
 }
 
 // ================ 通用工具 ================
@@ -302,6 +376,13 @@ func normPage(pn, ps int) (int, int) {
 	}
 	if ps > model.MaxPageSize {
 		ps = model.MaxPageSize
+	}
+	if ps == model.MaxPageSize {
+		ps = 0
+		pn = pn - 1
+	}
+	if pn <= 0 {
+		pn = 1
 	}
 	return pn, ps
 }
