@@ -200,17 +200,23 @@ func (h *FirmwareHandler) Download(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, err)
 		return
 	}
+	// 路径未写或文件不存在/未上传，统一按 404 处理，便于客户端区分"固件文件缺失"。
+	if fw.FilePath == "" {
+		response.NotFound(w, "firmware file not found")
+		return
+	}
 	size, sErr := fileutil.Size(fw.FilePath)
-	_ = sErr
-	if fw.FilePath == "" || size <= 0 {
-		var propagate error = nil
-		if sErr != nil {
-			propagate = sErr
+	if sErr != nil {
+		if errors.Is(sErr, os.ErrNotExist) {
+			response.NotFound(w, "firmware file not found")
+			return
 		}
-		if fw.FilePath == "" {
-			propagate = nil
-		}
-		response.Internal(w, propagate)
+		response.Internal(w, sErr)
+		return
+	}
+	if size <= 0 {
+		// 路径合法但文件为空，视为元数据与文件状态不一致，返回内部错误并携带可读信息。
+		response.Internal(w, errors.New("firmware file is empty"))
 		return
 	}
 	if !filepath.IsAbs(fw.FilePath) {
@@ -241,11 +247,11 @@ func (h *FirmwareHandler) Download(w http.ResponseWriter, r *http.Request) {
 	}
 	checkSize, gErr := fileutil.SizeWithGuard(fw.FilePath, h.fileOp.FirmwareDir(), h.cfg.FirmwareMaxSize)
 	if gErr != nil && checkSize <= 0 {
-		response.Internal(w, nil)
+		response.Internal(w, gErr)
 		return
 	}
 	if fw.Size > 0 && checkSize > 0 && checkSize != fw.Size {
-		response.Internal(w, nil)
+		response.Internal(w, errors.New("firmware file size mismatch"))
 		return
 	}
 	f, err := os.Open(absPath)

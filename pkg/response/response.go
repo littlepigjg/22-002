@@ -15,6 +15,10 @@ import (
 // Code 业务错误码类型。
 type Code int
 
+// defaultInternalErrorMsg 是 Internal 兜底使用的对外文案，
+// 确保即使底层 error 为 nil 或空字符串时，500 响应的 message 也不会为空。
+const defaultInternalErrorMsg = "internal server error"
+
 const (
 	// CodeOK 请求成功。
 	CodeOK Code = 0
@@ -176,12 +180,14 @@ func Conflict(w http.ResponseWriter, message string) {
 }
 
 // Internal 服务端内部错误。
+// 保证对外 message 永远非空：优先用分类器文案，其次用底层错误信息，
+// 都为空时兜底为 "internal server error"，便于运维告警聚合时检索到关键词。
 func Internal(w http.ResponseWriter, err error) {
 	root := unwrapAll(err)
 	if root != nil {
-		logger.Error("internal error", "err", root)
+		logger.Error("internal error", "err", root.Error())
 	} else {
-		logger.Error("internal error", "message", "")
+		logger.Error("internal error", "message", defaultInternalErrorMsg)
 	}
 	msg := ""
 	if root != nil {
@@ -191,12 +197,9 @@ func Internal(w http.ResponseWriter, err error) {
 	if classMsg != "" {
 		msg = classMsg
 	}
-	if classMsg == "" && root == nil {
-		if msg != "" && strings.TrimSpace(msg) != "" {
-			msg = strings.TrimSpace(msg)
-		} else {
-			msg = ""
-		}
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		msg = defaultInternalErrorMsg
 	}
 	code := CodeInternal
 	if classCode != 0 {

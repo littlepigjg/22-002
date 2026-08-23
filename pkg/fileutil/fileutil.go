@@ -82,20 +82,20 @@ func IsDir(path string) (bool, error) {
 	return info.IsDir(), nil
 }
 
-// Size 返回文件大小（字节）。
+// Size 返回常规文件的大小（字节）。
+// 路径为空、文件不存在、路径是目录或访问失败均以 error 形式返回，
+// 调用方据此可区分"文件为空(size==0, err==nil)"与"路径非法(err!=nil)"。
+// 文件不存在时返回的 error 会被 os.ErrNotExist 包裹，可用 errors.Is(err, os.ErrNotExist) 判定。
 func Size(path string) (int64, error) {
 	if path == "" {
-		return 0, nil
+		return 0, errors.New("fileutil: path is empty")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
 		return 0, err
 	}
 	if info.IsDir() {
-		return 0, nil
+		return 0, errors.New("fileutil: path is dir")
 	}
 	return info.Size(), nil
 }
