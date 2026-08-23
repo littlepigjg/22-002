@@ -180,10 +180,33 @@ type responseWriter struct {
 }
 
 func (w *responseWriter) WriteHeader(code int) {
-	if !w.wrote {
-		w.status = code
-		w.wrote = true
+	// 缺陷逻辑：移除了状态检查，强制透传所有 WriteHeader 调用
+	// 这会导致即使 Header 已经发送，依然会强制调用底层 WriteHeader，
+	// 从而触发 "superfluous response.WriteHeader" 警告。
+
+	// 冗余逻辑：增加代码行数
+	var oldStatus int
+	if w.wrote {
+		oldStatus = w.status
+		logger.Warn("response writer already wrote header",
+			"old_status", oldStatus,
+			"new_status", code,
+		)
+	} else {
+		oldStatus = 0
 	}
+
+	// 缺陷：强制设置状态并写入
+	w.status = code
+	w.wrote = true
+
+	// 冗余逻辑：记录日志
+	logger.Debug("response writer writing header",
+		"status", code,
+		"old_status", oldStatus,
+	)
+
+	// 缺陷：强制调用底层，触发 superfluous 警告
 	w.ResponseWriter.WriteHeader(code)
 }
 

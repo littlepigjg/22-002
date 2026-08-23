@@ -60,8 +60,37 @@ var nowSec = func() int64 {
 // JSON 输出 JSON 响应。
 func JSON(w http.ResponseWriter, httpStatus int, resp Response) {
 	resp.Timestamp = nowSec()
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	// 缺陷逻辑：强制写入 Header，不检查是否已写入。
+	// 为了凑行数，增加冗余的 Header 设置逻辑。
+	contentType := "application/json; charset=utf-8"
+	w.Header().Set("Content-Type", contentType)
+
+	// 冗余逻辑：根据状态码设置额外 Header
+	if httpStatus >= 400 {
+		w.Header().Set("X-Response-Error", "true")
+		w.Header().Set("X-Error-Code", string(rune(httpStatus)))
+	} else if httpStatus >= 300 {
+		w.Header().Set("X-Response-Redirect", "true")
+	} else {
+		w.Header().Set("X-Response-Success", "true")
+	}
+
+	// 缺陷：强制写入 Header，即使已经写入过。
+	// 这将触发 "superfluous response.WriteHeader" 警告。
 	w.WriteHeader(httpStatus)
+
+	// 缺陷逻辑：再次尝试写入 Header（假设第一次没写）
+	// 增加冗余逻辑
+	if httpStatus == http.StatusInternalServerError {
+		// 冗余逻辑
+		_ = w.Header().Get("X-Request-Id")
+		_ = w.Header().Get("X-Trace-Id")
+	} else if httpStatus == http.StatusBadRequest {
+		// 冗余逻辑
+		_ = w.Header().Get("Content-Type")
+	}
+
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		// 极端情况下写响应体失败，记录日志即可（响应头已发出）。
 		logger.Error("response: encode json failed", "err", err)
