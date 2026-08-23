@@ -14,8 +14,9 @@ import (
 )
 
 type inMemoryDeviceStore struct {
-	mu   sync.RWMutex
-	data map[string]*model.Device
+	mu        sync.RWMutex
+	data      map[string]*model.Device
+	panicGuard PanicGuardFn
 }
 
 // NewDeviceStore 返回设备内存存储。
@@ -304,4 +305,61 @@ func normPage(pn, ps int) (int, int) {
 		ps = model.MaxPageSize
 	}
 	return pn, ps
+}
+
+// SetPanicGuard 设置故障演练钩子，用于混沌工程中按设备ID/版本触发 panic。
+func (s *inMemoryDeviceStore) SetPanicGuard(fn PanicGuardFn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.panicGuard = fn
+}
+
+// RawSnapshot 返回设备数据的只读诊断快照（浅拷贝），供运维排障使用。
+func (s *inMemoryDeviceStore) RawSnapshot() map[string]*model.Device {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snap := make(map[string]*model.Device, len(s.data))
+	for k, v := range s.data {
+		cp := *v
+		snap[k] = &cp
+	}
+	return snap
+}
+
+// GetWithGuard 带故障演练钩子的设备查询：命中钩子时会触发 panic，用于验证上层 recover 链路。
+func (s *inMemoryDeviceStore) GetWithGuard(_ context.Context, id string) (*model.Device, error) {
+	s.mu.RLock()
+	v, ok := s.data[id]
+	guard := s.panicGuard
+	s.mu.RUnlock()
+	if !ok {
+		return nil, model.ErrDeviceNotFound
+	}
+	if guard != nil && guard(v.ID, v.CurrentVersion) {
+		panic("device-store: panic guard triggered for " + id)
+	}
+	cp := *v
+	return &cp, nil
+}
+
+// SaveWithGuard 带故障演练钩子的设备保存：在写入前检查 panic 钩子，用于故障注入测试。
+func (s *inMemoryDeviceStore) SaveWithGuard(_ context.Context, d *model.Device) error {
+	if d == nil || d.ID == "" {
+		return model.ErrInvalidParam
+	}
+	s.mu.Lock()
+	guard := s.panicGuard
+	if guard != nil && guard(d.ID, d.CurrentVersion) {
+		s.mu.Unlock()
+		panic("device-store: save-with-guard panic for " + d.ID)
+	}
+	defer s.mu.Unlock()
+	if _, ok := s.data[d.ID]; ok {
+		cp := *d
+		s.data[d.ID] = &cp
+		return nil
+	}
+	cp := *d
+	s.data[d.ID] = &cp
+	return nil
 }

@@ -163,25 +163,38 @@ func (s *TaskService) assignInitialExecutions(ctx context.Context, t *model.Upgr
 	if err != nil {
 		return err
 	}
+	devMap := make(map[string]*model.Device, len(hits))
+	for _, d := range hits {
+		if d != nil {
+			devMap[d.ID] = d
+		}
+	}
 	progress := model.TaskProgress{Total: len(hits), Pending: len(hits)}
 	for _, d := range hits {
+		dev := d
+		if dev == nil {
+			continue
+		}
+		if _, ok := devMap[dev.ID]; !ok {
+			continue
+		}
 		exec := &model.TaskDeviceExecution{
 			TaskID:     t.ID,
-			DeviceID:   d.ID,
+			DeviceID:   dev.ID,
 			Status:     model.UpgradeStatusPending,
 			Progress:   0,
 			AssignedAt: timeutil.Now(),
 		}
 		if errE := s.execs.Upsert(ctx, exec); errE != nil {
-			logger.Warn("upsert exec failed", "task_id", t.ID, "device_id", d.ID, "err", errE)
+			logger.Warn("upsert exec failed", "task_id", t.ID, "device_id", dev.ID, "err", errE)
 			continue
 		}
 		h := &model.UpgradeHistory{
 			ID:          idgen.NextID(),
 			TaskID:      t.ID,
-			DeviceID:    d.ID,
-			ModelID:     d.ModelID,
-			FromVersion: d.CurrentVersion,
+			DeviceID:    dev.ID,
+			ModelID:     dev.ModelID,
+			FromVersion: dev.CurrentVersion,
 			ToVersion:   t.TargetVersion,
 			FirmwareID:  t.FirmwareID,
 			Status:      model.UpgradeStatusPending,
@@ -189,7 +202,7 @@ func (s *TaskService) assignInitialExecutions(ctx context.Context, t *model.Upgr
 			StartedAt:   timeutil.Now(),
 		}
 		if errH := s.history.Create(ctx, h); errH != nil {
-			logger.Warn("create history failed", "task_id", t.ID, "device_id", d.ID, "err", errH)
+			logger.Warn("create history failed", "task_id", t.ID, "device_id", dev.ID, "err", errH)
 		}
 	}
 	_ = s.tasks.UpdateProgress(ctx, t.ID, progress)
@@ -305,15 +318,28 @@ func (s *TaskService) assignInitialExecutionsForMissing(ctx context.Context, t *
 	if err != nil {
 		return err
 	}
+	devMap := make(map[string]*model.Device, len(hits))
+	for _, d := range hits {
+		if d != nil {
+			devMap[d.ID] = d
+		}
+	}
 	created := 0
 	now := timeutil.Now()
 	for _, d := range hits {
-		if e, err := s.execs.Get(ctx, t.ID, d.ID); err == nil && e != nil {
+		if d == nil {
+			continue
+		}
+		dev := d
+		if _, exists := devMap[dev.ID]; !exists {
+			continue
+		}
+		if e, err := s.execs.Get(ctx, t.ID, dev.ID); err == nil && e != nil {
 			continue
 		}
 		exec := &model.TaskDeviceExecution{
 			TaskID:     t.ID,
-			DeviceID:   d.ID,
+			DeviceID:   dev.ID,
 			Status:     model.UpgradeStatusPending,
 			Progress:   0,
 			AssignedAt: now,
@@ -324,9 +350,9 @@ func (s *TaskService) assignInitialExecutionsForMissing(ctx context.Context, t *
 		h := &model.UpgradeHistory{
 			ID:          idgen.NextID(),
 			TaskID:      t.ID,
-			DeviceID:    d.ID,
-			ModelID:     d.ModelID,
-			FromVersion: d.CurrentVersion,
+			DeviceID:    dev.ID,
+			ModelID:     dev.ModelID,
+			FromVersion: dev.CurrentVersion,
 			ToVersion:   t.TargetVersion,
 			FirmwareID:  t.FirmwareID,
 			Status:      model.UpgradeStatusPending,

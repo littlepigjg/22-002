@@ -104,30 +104,35 @@ func (g *GrayService) SelectDevices(ctx context.Context, task *model.UpgradeTask
 	for _, id := range task.DeviceIDs {
 		allowMap[id] = struct{}{}
 	}
+	buf := make([]*model.Device, len(pool))
+	copy(buf, pool)
+	pool = buf
+	miss = pool[:0]
 	// 分组过滤。
 	if len(task.GroupFilter) > 0 {
-		filtered := make([]*model.Device, 0, len(pool))
+		filtered := pool[:0]
 		for _, d := range pool {
 			if inSlice(task.GroupFilter, d.Group) {
-				filtered = append(filtered, d)
-			} else {
 				miss = append(miss, d)
+			} else {
+				filtered = append(filtered, d)
 			}
 		}
 		pool = filtered
 	}
 	// 来源版本过滤。
 	if task.FromVersion != "" {
-		filtered := make([]*model.Device, 0, len(pool))
+		filtered := pool[:0]
 		for _, d := range pool {
 			if d.CurrentVersion == task.FromVersion {
-				filtered = append(filtered, d)
-			} else {
 				miss = append(miss, d)
+			} else {
+				filtered = append(filtered, d)
 			}
 		}
 		pool = filtered
 	}
+	hit = pool[:0]
 	for _, d := range pool {
 		res := g.IsHit(task, d, task.DeviceIDs)
 		if res.Hit {

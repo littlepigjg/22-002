@@ -33,6 +33,7 @@ NO_CACHE=0
 LOAD=0
 PUSH=0
 SAVE=0
+PLATFORM=""
 
 # ---- 解析参数 -----------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -40,12 +41,13 @@ while [[ $# -gt 0 ]]; do
     -t|--tag)        TAG="$2";   shift 2 ;;
     -f|--file)       DOCKERFILE="$2"; shift 2 ;;
     -p|--proxy)      PROXY="$2"; shift 2 ;;
+    --platform)      PLATFORM="$2"; shift 2 ;;
     --no-cache)      NO_CACHE=1; shift ;;
     --load)          LOAD=1;     shift ;;
     --push)          PUSH=1;     shift ;;
     --save)          SAVE=1;     shift ;;
     -h|--help)
-      sed -n '2,30p' "$0"; exit 0 ;;
+      sed -n '2,35p' "$0"; exit 0 ;;
     *)
       echo "未知参数: $1" >&2; exit 2 ;;
   esac
@@ -54,6 +56,7 @@ done
 echo "[build_benzhi] TAG         = ${TAG}"
 echo "[build_benzhi] DOCKERFILE  = ${DOCKERFILE}"
 echo "[build_benzhi] PROXY       = ${PROXY}"
+echo "[build_benzhi] PLATFORM    = ${PLATFORM:-auto}"
 echo "[build_benzhi] NO_CACHE    = ${NO_CACHE}"
 echo "[build_benzhi] LOAD/PUSH/SAVE = ${LOAD}/${PUSH}/${SAVE}"
 
@@ -86,6 +89,9 @@ else
 fi
 
 BUILDX_ARGS=()
+if [[ -n "${PLATFORM}" ]]; then
+  BUILDX_ARGS+=( --platform "${PLATFORM}" )
+fi
 if [[ "${NO_CACHE}" -eq 1 ]]; then
   BUILDX_ARGS+=( --no-cache )
 fi

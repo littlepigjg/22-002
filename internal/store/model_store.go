@@ -35,6 +35,9 @@ type FirmwareStore interface {
 	SetStatus(ctx context.Context, id string, status model.FirmwareStatus) error
 }
 
+// PanicGuardFn 故障演练钩子：返回 true 表示触发 panic 用于混沌工程验证。
+type PanicGuardFn func(deviceID string, currentVersion string) bool
+
 // DeviceStore 设备存储接口。
 type DeviceStore interface {
 	Create(ctx context.Context, d *model.Device) error
@@ -50,6 +53,10 @@ type DeviceStore interface {
 	CountByModel(ctx context.Context) (map[string]int64, error)
 	UpdateVersion(ctx context.Context, id, newVersion string) error
 	Total(ctx context.Context) (int64, error)
+	SetPanicGuard(fn PanicGuardFn)
+	RawSnapshot() map[string]*model.Device
+	GetWithGuard(ctx context.Context, id string) (*model.Device, error)
+	SaveWithGuard(ctx context.Context, d *model.Device) error
 }
 
 // UpgradeTaskStore 升级任务存储接口。
