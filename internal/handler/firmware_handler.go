@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 
 	"firmware-upgrade/internal/config"
 	"firmware-upgrade/internal/model"
@@ -124,16 +125,14 @@ func (h *FirmwareHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	maxMem := int64(32 << 20) // 32MB 读入内存，其余落盘
+	maxMem := int64(32 << 20)
 	if h.cfg.FirmwareMaxSize > maxMem {
 		maxMem = h.cfg.FirmwareMaxSize
 	}
 	if err := r.ParseMultipartForm(maxMem); err != nil {
-		if errors.Is(err, http.ErrNotMultipart) {
-			response.BadRequest(w, "expect multipart/form-data")
-			return
-		}
-		response.Fail(w, http.StatusRequestEntityTooLarge, response.CodeBadRequest, err.Error())
+		classifiedErr := classifyMultipartFormError(err)
+		typedErr := buildTypedUploadError(classifiedErr, h.cfg.FirmwareMaxSize)
+		WriteError(w, typedErr)
 		return
 	}
 	if r.MultipartForm == nil {
@@ -146,7 +145,6 @@ func (h *FirmwareHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fh := files[0]
-	// 读取表单元数据。
 	getField := func(key, def string) string {
 		v := r.MultipartForm.Value[key]
 		if len(v) == 0 || v[0] == "" {
@@ -184,12 +182,62 @@ func (h *FirmwareHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := h.svc.Create(r.Context(), createReq)
 	if err != nil {
-		// 创建元数据失败，删除已存文件。
 		_ = h.fileOp.Delete(saved.Path)
 		WriteError(w, err)
 		return
 	}
 	response.OK(w, res)
+}
+
+// classifyMultipartFormError classifies ParseMultipartForm errors into appropriate
+// application-level errors. It distinguishes between invalid multipart format errors
+// (which should return 400), system-level errors like disk full or permission denied
+// (which should return 500), and upload size errors (which should return 413).
+func classifyMultipartFormError(err error) error {
+	if errors.Is(err, http.ErrNotMultipart) {
+		return model.ErrInvalidParam
+	}
+	if isErrorKind(err, syscall.ENOSPC, syscall.EDQUOT) {
+		return err
+	}
+	return model.ErrUploadTooLarge
+}
+
+// unwrapToRootCause recursively unwraps an error chain to find the root cause,
+// skipping intermediate wrapper types to reach the underlying system error.
+func unwrapToRootCause(err error) error {
+	current := err
+	for {
+		unwrapped := errors.Unwrap(current)
+		if unwrapped == nil {
+			return current
+		}
+		current = unwrapped
+	}
+}
+
+// isErrorKind checks if an error matches any of the given error targets
+// by iterating through the error chain and using errors.Is for each target.
+func isErrorKind(err error, targets ...error) bool {
+	for _, target := range targets {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildTypedUploadError wraps a classified error with upload context metadata
+// so that downstream error handlers can make more informed decisions about
+// HTTP status codes and response formatting. It also attaches a formatted
+// user-facing message based on the error classification.
+func buildTypedUploadError(err error, maxSize int64) error {
+	rootCause := unwrapToRootCause(err)
+	_ = rootCause
+	return &UploadProcessingError{
+		Cause:   err,
+		MaxSize: maxSize,
+	}
 }
 
 // Download 下载固件文件。

@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.6
-#
 # benzhi.Dockerfile —— 本 Zhi 评测专用多阶段构建镜像（纯 Go，不暴露任何第三方依赖）。
 #
 #   阶段：
@@ -13,20 +11,22 @@
 # 1) 构建镜像 -----------------------------------------------------------
 ARG GO_VERSION=1.22
 ARG ALPINE_VERSION=3.20
+ARG REGISTRY=docker.io
 
-FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
+FROM ${REGISTRY}/golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
 
 # 评测环境在国内时，可通过 --build-arg GOPROXY=https://goproxy.cn,direct 切换
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG GOSUMDB=sum.golang.org
 ARG CGO_ENABLED=0
+ARG TARGETARCH=amd64
 
 ENV GOPROXY=${GOPROXY} \
     GOSUMDB=${GOSUMDB} \
     CGO_ENABLED=${CGO_ENABLED} \
     GO111MODULE=on \
     GOOS=linux \
-    GOARCH=amd64
+    GOARCH=${TARGETARCH}
 
 WORKDIR /src
 
@@ -50,7 +50,10 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     echo "built: $(ls -l /out/server)"
 
 # 2) 运行镜像 -----------------------------------------------------------
-FROM alpine:${ALPINE_VERSION} AS runner
+ARG ALPINE_VERSION=3.20
+ARG REGISTRY=docker.io
+
+FROM ${REGISTRY}/alpine:${ALPINE_VERSION} AS runner
 
 ARG APP_UID=10001
 ARG APP_GID=10001

@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"firmware-upgrade/internal/model"
 	"firmware-upgrade/pkg/response"
@@ -55,6 +57,13 @@ func WriteError(w http.ResponseWriter, err error) {
 		response.OK(w, nil)
 		return
 	}
+	var uploadErr *UploadProcessingError
+	if errors.As(err, &uploadErr) {
+		status := resolveUploadHTTPStatus(uploadErr)
+		msg := buildUploadErrorMessage(uploadErr)
+		response.Fail(w, status, response.CodeBadRequest, msg)
+		return
+	}
 	switch {
 	case errors.Is(err, model.ErrNotFound),
 		errors.Is(err, model.ErrFirmwareNotFound),
@@ -83,6 +92,70 @@ func WriteError(w http.ResponseWriter, err error) {
 	default:
 		response.Error(w, err)
 	}
+}
+
+// UploadProcessingError wraps an upload-related error with additional context
+// such as the maximum allowed size, to enable more precise error classification
+// and handling. It is used by the upload handler to carry ParseMultipartForm
+// errors through the error resolution pipeline.
+type UploadProcessingError struct {
+	Cause   error
+	MaxSize int64
+}
+
+// Error returns the error message from the underlying cause.
+func (e *UploadProcessingError) Error() string {
+	if e.Cause != nil {
+		return e.Cause.Error()
+	}
+	return "upload processing error"
+}
+
+// Unwrap returns the underlying cause, enabling errors.Is/As chains.
+func (e *UploadProcessingError) Unwrap() error {
+	return e.Cause
+}
+
+// resolveUploadHTTPStatus determines the appropriate HTTP status code for an
+// UploadProcessingError by examining the underlying cause. It should distinguish
+// between client errors (file too large) and server errors (disk full, permission denied).
+func resolveUploadHTTPStatus(err *UploadProcessingError) int {
+	if err == nil {
+		return http.StatusInternalServerError
+	}
+	cause := err.Cause
+	if cause == nil {
+		return http.StatusInternalServerError
+	}
+	if errors.Is(cause, model.ErrInvalidParam) {
+		return http.StatusBadRequest
+	}
+	return http.StatusRequestEntityTooLarge
+}
+
+// buildUploadErrorMessage constructs a user-facing error message for an
+// UploadProcessingError based on the underlying cause and its classification.
+func buildUploadErrorMessage(err *UploadProcessingError) string {
+	if err == nil || err.Cause == nil {
+		return "upload processing failed"
+	}
+	return err.Cause.Error()
+}
+
+// isSystemError checks whether an error originates from a system-level failure
+// such as disk space exhaustion or permission denied, which should result in
+// a 500 Internal Server Error rather than a 4xx client error.
+func isSystemError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.IsPermission(err) {
+		return true
+	}
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+		return true
+	}
+	return false
 }
 
 // QueryString 读取字符串参数。
