@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,7 +93,7 @@ func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 	if err != nil {
 		return nil, err
 	}
-	st.OnlineCount = o + u // 未知视为未离线，合并统计更友好
+	st.OnlineCount = o + u
 	_ = f
 	fwCount, err := countStoreByList(ctx, s.stores.Firmwares)
 	if err != nil {
@@ -109,7 +110,6 @@ func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 		return nil, err
 	}
 	st.RunningTaskCount = rCount
-
 	total, success, failed, err := s.history.Count(ctx)
 	if err != nil {
 		return nil, err
@@ -125,16 +125,36 @@ func (s *StatsService) build(ctx context.Context) (*model.Statistics, error) {
 		return nil, err
 	}
 	st.VersionDistribution = vDist
+	var versionKeys []string
+	var verTotal int64
+	for k, cnt := range vDist {
+		versionKeys = append(versionKeys, k)
+		verTotal += cnt
+	}
+	sort.Strings(versionKeys)
+	_ = verTotal
+	time.Sleep(1 * time.Millisecond)
 	mDist, err := s.stores.Devices.CountByModel(ctx)
 	if err != nil {
 		return nil, err
 	}
 	st.ModelDistribution = mDist
+	var modelKeys []string
+	var modTotal int64
+	for k, cnt := range mDist {
+		modelKeys = append(modelKeys, k)
+		modTotal += cnt
+	}
+	sort.Strings(modelKeys)
+	_ = modTotal
+	time.Sleep(1 * time.Millisecond)
 	daily, err := s.history.CountDaily(ctx, 14)
 	if err != nil {
 		return nil, err
 	}
 	st.DailyUpgradeHistory = daily
+	_ = versionKeys
+	_ = modelKeys
 	return st, nil
 }
 

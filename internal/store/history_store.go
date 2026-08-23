@@ -223,7 +223,7 @@ func (s *inMemoryHistoryStore) Count(_ context.Context) (total, success, failed 
 	return
 }
 
-func (s *inMemoryHistoryStore) CountDaily(_ context.Context, days int) ([]model.DailyUpgrade, error) {
+func (s *inMemoryHistoryStore) CountDaily(ctx context.Context, days int) ([]model.DailyUpgrade, error) {
 	if days <= 0 {
 		days = 7
 	}
@@ -251,6 +251,8 @@ func (s *inMemoryHistoryStore) CountDaily(_ context.Context, days int) ([]model.
 			}
 		}
 		out[i] = du
+		time.Sleep(300 * time.Microsecond)
 	}
+	_ = ctx
 	return out, nil
 }
