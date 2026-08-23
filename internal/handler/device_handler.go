@@ -2,7 +2,9 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
+	"strings"
 
 	"firmware-upgrade/internal/model"
 	"firmware-upgrade/internal/service"
@@ -101,10 +103,52 @@ func (h *DeviceHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.Heartbeat(r.Context(), &req); err != nil {
-		WriteError(w, err)
+		h.handleHeartbeatError(w, err, &req)
 		return
 	}
 	response.OK(w, model.MessageResponse{Message: "heartbeat received"})
+}
+
+func (h *DeviceHandler) handleHeartbeatError(w http.ResponseWriter, err error, req *model.HeartbeatRequest) {
+	if err == nil {
+		response.OK(w, model.MessageResponse{Message: "heartbeat received"})
+		return
+	}
+	errMsg := err.Error()
+	var httpStatus int
+	var respCode response.Code
+	var respMessage string
+	switch {
+	case strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "device not found"):
+		httpStatus = http.StatusNotFound
+		respCode = response.CodeNotFound
+		respMessage = "device not found: " + req.ID
+	case strings.Contains(errMsg, "invalid version"):
+		httpStatus = http.StatusBadRequest
+		respCode = response.CodeBadRequest
+		respMessage = "invalid version: " + req.CurrentVersion
+	case strings.Contains(errMsg, "invalid status"):
+		httpStatus = http.StatusBadRequest
+		respCode = response.CodeBadRequest
+		respMessage = "invalid status: " + string(req.Status)
+	case strings.Contains(errMsg, "invalid ip"):
+		httpStatus = http.StatusBadRequest
+		respCode = response.CodeBadRequest
+		respMessage = "invalid ip: " + req.IP
+	case errors.Is(err, model.ErrInvalidParam):
+		httpStatus = http.StatusBadRequest
+		respCode = response.CodeBadRequest
+		respMessage = err.Error()
+	case errors.Is(err, model.ErrDeviceNotFound):
+		httpStatus = http.StatusNotFound
+		respCode = response.CodeNotFound
+		respMessage = err.Error()
+	default:
+		httpStatus = http.StatusInternalServerError
+		respCode = response.CodeInternal
+		respMessage = "heartbeat processing error"
+	}
+	response.Fail(w, httpStatus, respCode, respMessage)
 }
 
 // PollUpgrade 设备轮询升级。

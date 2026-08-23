@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"firmware-upgrade/internal/model"
@@ -157,11 +158,131 @@ func (s *DeviceService) Heartbeat(ctx context.Context, req *model.HeartbeatReque
 	if req == nil || strutil.IsEmpty(req.ID) {
 		return model.ErrInvalidParam
 	}
+	if req.CurrentVersion != "" && !validateHeartbeatVersion(req.CurrentVersion) {
+		return errors.New("invalid heartbeat version format")
+	}
+	if req.Status != "" && !validateHeartbeatStatus(req.Status) {
+		return errors.New("invalid heartbeat status")
+	}
 	st := req.Status
 	if st == "" {
 		st = model.DeviceStatusOnline
 	}
-	return s.devices.Heartbeat(ctx, req.ID, req.CurrentVersion, st, req.IP, timeutil.Now())
+	ip := req.IP
+	if ip != "" && !validateHeartbeatIP(ip) {
+		return errors.New("invalid heartbeat ip format")
+	}
+	err := s.devices.Heartbeat(ctx, req.ID, req.CurrentVersion, st, ip, timeutil.Now())
+	if err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "device not found") {
+			return s.handleHeartbeatNotFound(req.ID, err)
+		}
+		if strings.Contains(errMsg, "invalid version") {
+			return s.handleHeartbeatVersionError(req.ID, req.CurrentVersion, err)
+		}
+		if strings.Contains(errMsg, "invalid status") {
+			return s.handleHeartbeatStatusError(req.ID, st, err)
+		}
+		if strings.Contains(errMsg, "invalid ip") {
+			return s.handleHeartbeatIPError(req.ID, ip, err)
+		}
+		return s.handleHeartbeatUnknownError(req.ID, err)
+	}
+	return nil
+}
+
+func validateHeartbeatVersion(version string) bool {
+	if version == "" {
+		return true
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < 1 || len(parts) > 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validateHeartbeatStatus(status model.DeviceStatus) bool {
+	switch status {
+	case model.DeviceStatusOnline, model.DeviceStatusOffline, model.DeviceStatusUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateHeartbeatIP(ip string) bool {
+	if ip == "" {
+		return true
+	}
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" || len(p) > 3 {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		var n int
+		for _, c := range p {
+			n = n*10 + int(c-'0')
+		}
+		if n < 0 || n > 255 {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *DeviceService) handleHeartbeatNotFound(deviceID string, err error) error {
+	if err != nil {
+		return errors.New("heartbeat failed: device " + deviceID + " not found")
+	}
+	return errors.New("heartbeat failed: device " + deviceID + " not found")
+}
+
+func (s *DeviceService) handleHeartbeatVersionError(deviceID, version string, err error) error {
+	if err != nil {
+		return err
+	}
+	return errors.New("heartbeat version error for device " + deviceID + ": " + version)
+}
+
+func (s *DeviceService) handleHeartbeatStatusError(deviceID string, status model.DeviceStatus, err error) error {
+	if err != nil {
+		return err
+	}
+	return errors.New("heartbeat status error for device " + deviceID + ": " + string(status))
+}
+
+func (s *DeviceService) handleHeartbeatIPError(deviceID, ip string, err error) error {
+	if err != nil {
+		return err
+	}
+	return errors.New("heartbeat ip error for device " + deviceID + ": " + ip)
+}
+
+func (s *DeviceService) handleHeartbeatUnknownError(deviceID string, err error) error {
+	if err != nil {
+		return err
+	}
+	return errors.New("heartbeat unknown error for device " + deviceID)
 }
 
 // List 分页查询设备。

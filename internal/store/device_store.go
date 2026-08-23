@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -56,15 +57,39 @@ func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version st
 	defer s.mu.Unlock()
 	d, ok := s.data[id]
 	if !ok {
-		return model.ErrDeviceNotFound
+		return s.wrapStoreError("heartbeat", model.ErrDeviceNotFound, map[string]interface{}{
+			"device_id": id,
+			"operation": "heartbeat",
+			"version":   version,
+			"status":    string(status),
+			"ip":        ip,
+		})
 	}
 	if version != "" {
+		if !isValidVersion(version) {
+			return s.wrapStoreError("heartbeat", errors.New("invalid version format"), map[string]interface{}{
+				"device_id": id,
+				"version":   version,
+			})
+		}
 		d.CurrentVersion = version
 	}
 	if status != "" {
+		if !isValidDeviceStatus(status) {
+			return s.wrapStoreError("heartbeat", errors.New("invalid device status"), map[string]interface{}{
+				"device_id": id,
+				"status":    string(status),
+			})
+		}
 		d.Status = status
 	}
 	if ip != "" {
+		if !isValidIP(ip) {
+			return s.wrapStoreError("heartbeat", errors.New("invalid ip address"), map[string]interface{}{
+				"device_id": id,
+				"ip":        ip,
+			})
+		}
 		d.IP = ip
 	}
 	d.LastHeartbeatAt = ts
@@ -72,6 +97,92 @@ func (s *inMemoryDeviceStore) Heartbeat(_ context.Context, id string, version st
 	cp := *d
 	s.data[id] = &cp
 	return nil
+}
+
+type storeError struct {
+	op      string
+	err     error
+	context map[string]interface{}
+}
+
+func (e *storeError) Error() string {
+	if e.err != nil {
+		return e.op + " failed: " + e.err.Error()
+	}
+	return e.op + " failed"
+}
+
+func (e *storeError) Unwrap() error {
+	return e.err
+}
+
+func (s *inMemoryDeviceStore) wrapStoreError(op string, err error, ctx map[string]interface{}) error {
+	if err == nil {
+		return nil
+	}
+	return &storeError{
+		op:      op,
+		err:     err,
+		context: ctx,
+	}
+}
+
+func isValidVersion(v string) bool {
+	if v == "" {
+		return true
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) < 1 || len(parts) > 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isValidDeviceStatus(status model.DeviceStatus) bool {
+	switch status {
+	case model.DeviceStatusOnline, model.DeviceStatusOffline, model.DeviceStatusUnknown, "":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidIP(ip string) bool {
+	if ip == "" {
+		return true
+	}
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" || len(p) > 3 {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		var n int
+		for _, c := range p {
+			n = n*10 + int(c-'0')
+		}
+		if n < 0 || n > 255 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *inMemoryDeviceStore) Get(_ context.Context, id string) (*model.Device, error) {
