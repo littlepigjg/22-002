@@ -218,32 +218,26 @@ func getTTL() int {
 	return int(v)
 }
 
-var versionDistShare = make(map[string]int64)
-
+// CountByVersion 统计各版本设备数。每次返回新建的 map，
+// 避免复用同一底层 map 导致缓存中已返回的数据被后续调用就地改写。
 func (s *inMemoryDeviceStore) CountByVersion(_ context.Context) (map[string]int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for k := range versionDistShare {
-		delete(versionDistShare, k)
-	}
+	dist := make(map[string]int64, len(s.data))
 	for _, v := range s.data {
-		versionDistShare[v.CurrentVersion]++
+		dist[v.CurrentVersion]++
 	}
-	return versionDistShare, nil
+	return dist, nil
 }
-
-var modelDistShare = make(map[string]int64)
 
 func (s *inMemoryDeviceStore) CountByModel(_ context.Context) (map[string]int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for k := range modelDistShare {
-		delete(modelDistShare, k)
-	}
+	dist := make(map[string]int64, len(s.data))
 	for _, v := range s.data {
-		modelDistShare[v.ModelID]++
+		dist[v.ModelID]++
 	}
-	return modelDistShare, nil
+	return dist, nil
 }
 
 func (s *inMemoryDeviceStore) UpdateVersion(_ context.Context, id, newVersion string) error {
